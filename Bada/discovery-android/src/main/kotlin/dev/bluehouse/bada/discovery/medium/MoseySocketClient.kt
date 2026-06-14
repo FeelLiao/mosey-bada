@@ -48,14 +48,18 @@ public class MoseySocketClient(
         private const val DEFAULT_READ_TIMEOUT_MS = 30000
         private const val MAX_FRAME_SIZE = 64 * 1024
 
-        private const val FRAME_REQUEST: Byte = 0x01
-        private const val FRAME_REPLY: Byte = 0x02
         private const val FRAME_EVENT: Byte = 0x03
         private const val CMD_GET_VERSION: Byte = 0
         private const val CMD_START: Byte = 1
         private const val CMD_STOP: Byte = 2
         private const val CMD_UPDATE: Byte = 3
         private const val CMD_SUBSCRIBE: Byte = 4
+        internal const val CMD_WAKE_BADA: Byte = 5
+        internal const val CMD_ENABLE: Byte = 6
+        internal const val CMD_DISABLE: Byte = 7
+        internal const val CMD_STATUS: Byte = 8
+        internal const val FRAME_REQUEST: Byte = 0x01
+        internal const val FRAME_REPLY: Byte = 0x02
         private const val EVENT_AIRDROP_FOUND: Byte = 0x01
         private const val EVENT_AIRDROP_LOST: Byte = 0x02
         private const val EVENT_APPLE_BLE_SEEN: Byte = 0x03
@@ -118,6 +122,71 @@ public class MoseySocketClient(
         ensureConnected()
         val reply = sendRequest(CMD_UPDATE, countryCode.encodeToByteArray())
         return reply.status == 0 && reply.data.size >= 4 && readInt32(reply.data, 0) == 0
+    }
+
+    /**
+     * Sends CMD_WAKE_BADA to the bridge, which broadcasts
+     * [dev.bluehouse.bada.airdrop.WAKE] to start [ReceiverForegroundService].
+     */
+    public fun sendWakeBada(): Boolean {
+        if (!connected.get()) return false
+        return try {
+            val reply = sendRequest(CMD_WAKE_BADA)
+            reply.status == 0
+        } catch (e: Exception) {
+            Log.w(TAG, "sendWakeBada failed: ${e.message}")
+            false
+        }
+    }
+
+    /**
+     * Sends CMD_ENABLE to the bridge to enable the mosey stack
+     * (disconnect Wi-Fi, start mosey_server/bridge/shim).
+     */
+    public fun sendEnable(): Boolean {
+        if (!connected.get()) return false
+        return try {
+            val reply = sendRequest(CMD_ENABLE)
+            reply.status == 0
+        } catch (e: Exception) {
+            Log.w(TAG, "sendEnable failed: ${e.message}")
+            false
+        }
+    }
+
+    /**
+     * Sends CMD_DISABLE to the bridge to disable the mosey stack
+     * (stop mosey_server/bridge/shim, re-enable Wi-Fi).
+     */
+    public fun sendDisable(): Boolean {
+        if (!connected.get()) return false
+        return try {
+            val reply = sendRequest(CMD_DISABLE)
+            reply.status == 0
+        } catch (e: Exception) {
+            Log.w(TAG, "sendDisable failed: ${e.message}")
+            false
+        }
+    }
+
+    /**
+     * Sends CMD_STATUS to the bridge to query current mosey stack status.
+     * Returns the JSON status string on success, or null on failure.
+     */
+    public fun sendStatus(): String? {
+        if (!connected.get()) return null
+        return try {
+            val reply = sendRequest(CMD_STATUS)
+            if (reply.status == 0 && reply.data.size >= 4) {
+                val jsonLen = readInt32(reply.data, 0)
+                if (jsonLen in 1..4096) {
+                    reply.data.copyOfRange(4, 4 + jsonLen).decodeToString()
+                } else null
+            } else null
+        } catch (e: Exception) {
+            Log.w(TAG, "sendStatus failed: ${e.message}")
+            null
+        }
     }
 
     public fun setEventHandler(handler: MoseyEventHandler) {
@@ -210,7 +279,14 @@ public class MoseySocketClient(
             when (eventType) {
                 EVENT_AIRDROP_FOUND -> handleFound(json)
                 EVENT_AIRDROP_LOST -> handleLost(json)
-                EVENT_APPLE_BLE_SEEN -> Log.d(TAG, "Apple BLE wakeup observed: $jsonText")
+                EVENT_APPLE_BLE_SEEN -> {
+                    Log.d(TAG, "Apple BLE wakeup observed: $jsonText")
+                    val deviceName = json.optString("deviceName")
+                        .ifBlank { json.optString("name", "Apple device") }
+                    val mac = json.optString("mac")
+                        .takeIf { it.isNotBlank() }
+                    eventHandler.get()?.onAppleBleSeen(deviceName, mac)
+                }
                 else -> Log.w(TAG, "Unknown Mosey event type=$eventType")
             }
         } catch (e: Exception) {

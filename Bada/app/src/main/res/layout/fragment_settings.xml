@@ -382,6 +382,130 @@
 
         </LinearLayout>
 
+        <!-- ============ Card 5: Mosey AirDrop ============ -->
+        <LinearLayout
+            android:id="@+id/mosey_settings_card"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:layout_marginBottom="12dp"
+            android:background="@drawable/settings_card_background"
+            android:orientation="vertical"
+            android:padding="20dp">
+
+            <TextView
+                android:id="@+id/mosey_settings_title"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="@string/mosey_settings_title"
+                android:textAppearance="@style/TextAppearance.AppCompat.Subhead"
+                android:textColor="?android:attr/textColorPrimary"
+                android:textStyle="bold" />
+
+            <TextView
+                android:id="@+id/mosey_settings_subtitle"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="6dp"
+                android:text="@string/mosey_settings_subtitle"
+                android:textAppearance="@style/TextAppearance.AppCompat.Small"
+                android:textColor="?android:attr/textColorSecondary" />
+
+            <!-- Status chip -->
+            <TextView
+                android:id="@+id/mosey_status_chip"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="12dp"
+                android:background="@drawable/qr_url_background"
+                android:paddingHorizontal="12dp"
+                android:paddingVertical="10dp"
+                android:textAppearance="@style/TextAppearance.AppCompat.Body2"
+                android:textColor="?android:attr/textColorPrimary"
+                android:textIsSelectable="true"
+                tools:text="已关闭 — 点击启用" />
+
+            <!-- Status grid: 3 columns x 2 rows -->
+            <GridLayout
+                android:id="@+id/mosey_status_grid"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="12dp"
+                android:columnCount="3"
+                android:rowCount="2">
+
+                <TextView
+                    android:id="@+id/mosey_server_status"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_columnWeight="1"
+                    android:gravity="center"
+                    android:padding="4dp"
+                    android:textAppearance="@style/TextAppearance.AppCompat.Small"
+                    tools:text="● server" />
+
+                <TextView
+                    android:id="@+id/mosey_bridge_status"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_columnWeight="1"
+                    android:gravity="center"
+                    android:padding="4dp"
+                    android:textAppearance="@style/TextAppearance.AppCompat.Small"
+                    tools:text="● bridge" />
+
+                <TextView
+                    android:id="@+id/mosey_shim_status"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_columnWeight="1"
+                    android:gravity="center"
+                    android:padding="4dp"
+                    android:textAppearance="@style/TextAppearance.AppCompat.Small"
+                    tools:text="● shim" />
+
+                <TextView
+                    android:id="@+id/mosey_wifi_status"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_columnWeight="1"
+                    android:gravity="center"
+                    android:padding="4dp"
+                    android:textAppearance="@style/TextAppearance.AppCompat.Small"
+                    tools:text="● Wi-Fi" />
+
+                <TextView
+                    android:id="@+id/mosey_interface_status"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_columnWeight="1"
+                    android:gravity="center"
+                    android:padding="4dp"
+                    android:textAppearance="@style/TextAppearance.AppCompat.Small"
+                    tools:text="● mosey0" />
+
+                <TextView
+                    android:id="@+id/mosey_kernel_status"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_columnWeight="1"
+                    android:gravity="center"
+                    android:padding="4dp"
+                    android:textAppearance="@style/TextAppearance.AppCompat.Small"
+                    tools:text="● wonder" />
+
+            </GridLayout>
+
+            <!-- Toggle button -->
+            <Button
+                android:id="@+id/mosey_toggle_btn"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="16dp"
+                android:text="@string/mosey_settings_enable" />
+
+        </LinearLayout>
+
     </LinearLayout>
 
 </ScrollView>

@@ -476,4 +476,31 @@
     <string name="qs_tile_subtitle_off">Off</string>
     <string name="qs_tile_content_desc_on">Bada is discoverable to nearby devices</string>
     <string name="qs_tile_content_desc_off">Bada is not discoverable</string>
+
+    <!--
+      Mosey / AirDrop settings card. Controls the root-level mosey
+      stack (enable/disable) and displays live status from the bridge.
+    -->
+    <string name="mosey_settings_title">Mosey AirDrop</string>
+    <string name="mosey_settings_subtitle">AWDL 发现桥接，启用后将断开 Wi-Fi 连接</string>
+    <string name="mosey_settings_enable">启用 Mosey</string>
+    <string name="mosey_settings_disable">关闭 Mosey</string>
+    <string name="mosey_status_enabled">AirDrop 正在运行，Wi-Fi 已断开</string>
+    <string name="mosey_status_disabled">已关闭 — 点击启用</string>
+    <string name="mosey_status_bridge_unreachable">Bridge 不可达（模块未安装？）</string>
+    <string name="mosey_server_label">mosey_server</string>
+    <string name="mosey_bridge_label">mosey_bridge</string>
+    <string name="mosey_shim_label">shim</string>
+    <string name="mosey_wifi_label">Wi-Fi</string>
+    <string name="mosey_interface_label">mosey0</string>
+    <string name="mosey_kernel_label">wonder.ko</string>
+    <string name="mosey_running">运行中</string>
+    <string name="mosey_stopped">已停止</string>
+    <string name="mosey_wifi_on">已连接</string>
+    <string name="mosey_wifi_off">已断开</string>
+    <string name="mosey_interface_yes">存在</string>
+    <string name="mosey_interface_no">不存在</string>
+    <string name="mosey_kernel_loaded">已加载</string>
+    <string name="mosey_kernel_missing">未加载</string>
+    <string name="mosey_unknown">未知</string>
 </resources>

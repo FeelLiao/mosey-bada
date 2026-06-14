@@ -52,4 +52,15 @@ public interface MoseyEventHandler {
      * @param reason A human-readable description of the disconnection cause.
      */
     public fun onDisconnected(reason: String)
+
+    /**
+     * Called when an Apple BLE beacon is observed nearby.
+     * This is an early wake-up signal — an Apple device may be about to
+     * send an AirDrop. The receiver should consider waking Bada's
+     * ReceiverForegroundService via CMD_WAKE_BADA.
+     *
+     * @param deviceName The device name from the BLE advertisement.
+     * @param mac The MAC address if available, or null.
+     */
+    public fun onAppleBleSeen(deviceName: String, mac: String?)
 }

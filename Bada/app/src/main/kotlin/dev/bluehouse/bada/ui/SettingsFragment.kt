@@ -17,11 +17,14 @@ import androidx.activity.result.ActivityResultLauncher
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.widget.SwitchCompat
 import androidx.fragment.app.Fragment
+import androidx.lifecycle.lifecycleScope
 import dev.bluehouse.bada.MainActivity
 import dev.bluehouse.bada.R
 import dev.bluehouse.bada.battery.BatteryOptimizationOemHelper
 import dev.bluehouse.bada.bugreport.BugReportPreferences
 import dev.bluehouse.bada.consent.FullScreenIntentPermission
+import dev.bluehouse.bada.discovery.medium.MoseyControlClient
+import dev.bluehouse.bada.service.airdrop.StatusRepository
 import dev.bluehouse.bada.service.downloads.SaveLocationDisplayName
 import dev.bluehouse.bada.service.downloads.SaveLocationPreferences
 import dev.bluehouse.bada.service.receiver.AdvertisedDeviceNames
@@ -128,6 +131,21 @@ internal class SettingsFragment : Fragment(R.layout.fragment_settings) {
         bugReportSwitch.setOnCheckedChangeListener { _, checked ->
             bugReportPreferences.setShakeToReportEnabled(checked)
         }
+
+        // ── Mosey AirDrop Card ──
+        val moseyControl = MoseyControlClient()
+        val statusRepo = StatusRepository.getInstance(requireContext())
+        val moseyToggle = view.findViewById<Button>(R.id.mosey_toggle_btn)
+        moseyToggle.setOnClickListener {
+            val enabled = statusRepo.rootState.value.enabled
+            val success = if (enabled) moseyControl.disable() else moseyControl.enable()
+            if (success) {
+                refreshMoseyStatus(view, statusRepo)
+            } else {
+                Toast.makeText(requireContext(), "Mosey ${if (enabled) "关闭" else "开启"}失败", Toast.LENGTH_SHORT).show()
+            }
+        }
+        statusRepo.startPolling(viewLifecycleOwner.lifecycleScope)
     }
 
     override fun onStart() {
@@ -142,6 +160,10 @@ internal class SettingsFragment : Fragment(R.layout.fragment_settings) {
         refreshBatteryStatus()
         refreshFullScreenIntentSection()
         refreshBugReportSwitch()
+        val v = view
+        if (v != null) {
+            refreshMoseyStatus(v, StatusRepository.getInstance(requireContext()))
+        }
     }
 
     override fun onResume() {
@@ -257,6 +279,51 @@ internal class SettingsFragment : Fragment(R.layout.fragment_settings) {
                 R.string.main_advertised_name_current,
                 AdvertisedDeviceNames.resolve(ctx),
             )
+    }
+
+    /**
+     * Refresh the Mosey status chip and grid labels from
+     * [StatusRepository]. Called from [onStart] and after
+     * enable/disable toggle.
+     */
+    private fun refreshMoseyStatus(v: View, repo: StatusRepository) {
+        val root = repo.rootState.value
+        val statusChip = v.findViewById<TextView>(R.id.mosey_status_chip)
+        val toggleBtn = v.findViewById<Button>(R.id.mosey_toggle_btn)
+
+        if (!root.bridgeReachable) {
+            statusChip?.text = getString(R.string.mosey_status_bridge_unreachable)
+            toggleBtn?.text = getString(R.string.mosey_settings_enable)
+            return
+        }
+
+        if (root.enabled) {
+            statusChip?.text = getString(R.string.mosey_status_enabled)
+            toggleBtn?.text = getString(R.string.mosey_settings_disable)
+        } else {
+            statusChip?.text = getString(R.string.mosey_status_disabled)
+            toggleBtn?.text = getString(R.string.mosey_settings_enable)
+        }
+
+        fun moseyStatusLabel(running: Boolean): String {
+            val prefix = if (running) "\u25CF " else "\u25CB "
+            return prefix + if (running) getString(R.string.mosey_running) else getString(R.string.mosey_stopped)
+        }
+
+        v.findViewById<TextView>(R.id.mosey_server_status)?.text =
+            getString(R.string.mosey_server_label) + " " + moseyStatusLabel(root.nativeRunning)
+        v.findViewById<TextView>(R.id.mosey_bridge_status)?.text =
+            getString(R.string.mosey_bridge_label) + " " + moseyStatusLabel(root.bridgeRunning)
+        v.findViewById<TextView>(R.id.mosey_shim_status)?.text =
+            getString(R.string.mosey_shim_label) + " " + moseyStatusLabel(root.shimRunning)
+
+        val wifiLabel = getString(R.string.mosey_wifi_label) + " " +
+            if (root.wifiConnected) getString(R.string.mosey_wifi_on) else getString(R.string.mosey_wifi_off)
+        v.findViewById<TextView>(R.id.mosey_wifi_status)?.text = wifiLabel
+
+        val ifaceLabel = getString(R.string.mosey_interface_label) + " " +
+            if (root.mosey0Exists) getString(R.string.mosey_interface_yes) else getString(R.string.mosey_interface_no)
+        v.findViewById<TextView>(R.id.mosey_interface_status)?.text = ifaceLabel
     }
 
     private companion object {

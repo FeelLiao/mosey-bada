@@ -40,6 +40,9 @@
 #define CMD_UPDATE 3
 #define CMD_SUBSCRIBE 4
 #define CMD_WAKE_BADA 5
+#define CMD_ENABLE 6
+#define CMD_DISABLE 7
+#define CMD_STATUS 8
 #define TR_GET_VERSION 16777215
 #define TR_START 1
 #define TR_STOP 2
@@ -513,17 +516,60 @@ static void* client_thread(void* arg) {
         if (cmd == CMD_SUBSCRIBE) {
             set_subscriber(client);
         } else if (cmd == CMD_WAKE_BADA) {
+            /* 发送广播到 AirDropWakeReceiver（exported=true，可跨包访问）*/
             int rc = system(
-                "/system/bin/am force-stop dev.bluehouse.bada.debug >/dev/null 2>&1; "
-                "/system/bin/am start-foreground-service -n "
-                "dev.bluehouse.bada.debug/dev.bluehouse.bada.service.receiver.ReceiverForegroundService "
-                ">/dev/null 2>&1 || "
-                "/system/bin/am start-foreground-service -n "
-                "dev.bluehouse.bada/dev.bluehouse.bada.service.receiver.ReceiverForegroundService "
-                ">/dev/null 2>&1");
+                "/system/bin/am broadcast -a dev.bluehouse.bada.airdrop.WAKE "
+                "-n dev.bluehouse.bada.debug/dev.bluehouse.bada.service.airdrop.AirDropWakeReceiver "
+                "--include-stopped-packages >/dev/null 2>&1 || "
+                "/system/bin/am broadcast -a dev.bluehouse.bada.airdrop.WAKE "
+                "-n dev.bluehouse.bada/dev.bluehouse.bada.service.airdrop.AirDropWakeReceiver "
+                "--include-stopped-packages >/dev/null 2>&1");
             value = (rc == 0) ? 0 : -1;
             status = value;
             LOGI("command=wake_bada result=%d", rc);
+        } else if (cmd == CMD_ENABLE) {
+            int rc = system(
+                "/system/bin/sh /data/adb/modules/mosey-enabler/mosey-control.sh "
+                "webui enable >/dev/null 2>&1");
+            value = (rc == 0) ? 0 : -1;
+            status = value;
+            LOGI("command=enable result=%d", rc);
+        } else if (cmd == CMD_DISABLE) {
+            int rc = system(
+                "/system/bin/sh /data/adb/modules/mosey-enabler/mosey-control.sh "
+                "webui disable >/dev/null 2>&1");
+            value = (rc == 0) ? 0 : -1;
+            status = value;
+            LOGI("command=disable result=%d", rc);
+        } else if (cmd == CMD_STATUS) {
+            FILE* fp = popen(
+                "/system/bin/sh /data/adb/modules/mosey-enabler/mosey-control.sh "
+                "webui status 2>/dev/null", "re");
+            if (fp) {
+                char buf[4096];
+                size_t n = fread(buf, 1, sizeof(buf) - 1, fp);
+                int rc = pclose(fp);
+                if (rc == 0 && n > 0) {
+                    /* reply: [status:i32=0][json_len:u32][json_bytes...] */
+                    uint32_t json_len = (uint32_t)n;
+                    uint8_t* reply = malloc(8 + json_len);
+                    if (reply) {
+                        write_i32(reply, 0);           /* status = 0 */
+                        write_i32(reply + 4, (int32_t)json_len);
+                        memcpy(reply + 8, buf, json_len);
+                        send_frame_locked(client, FRAME_REPLY, reply, 8 + json_len);
+                        free(reply);
+                        free(payload);
+                        continue;  /* skip default reply */
+                    }
+                }
+                status = -1;
+                value = -1;
+            } else {
+                status = -1;
+                value = -1;
+                LOGE("popen failed for CMD_STATUS");
+            }
         } else if (cmd <= CMD_UPDATE) {
             value = backend_call(cmd, payload + 1, len - 1);
             status = value >= 0 ? 0 : -1;

@@ -50,6 +50,14 @@ public class AirDropLocalServer(context: Context) : Closeable {
                 val input = BufferedInputStream(client.getInputStream())
                 val output = BufferedOutputStream(client.getOutputStream())
                 val request = readRequest(input)
+
+                // ── Expect: 100-continue ──
+                if (request.headers["expect"]?.contains("100-continue", ignoreCase = true) == true) {
+                    output.write("HTTP/1.1 100 Continue\r\n\r\n".toByteArray())
+                    output.flush()
+                    Log.d(TAG, "Sent 100 Continue for ${request.method} ${request.path}")
+                }
+
                 when (request.path) {
                     "/Ask" -> handleAsk(request, output)
                     "/Upload" -> handleUpload(request, input, output)
@@ -123,6 +131,7 @@ public class AirDropLocalServer(context: Context) : Closeable {
     }
 
     private data class Request(
+        val method: String,
         val path: String,
         val headers: Map<String, String>,
         val input: BufferedInputStream,
@@ -141,12 +150,14 @@ public class AirDropLocalServer(context: Context) : Closeable {
     private fun readRequest(input: BufferedInputStream): Request {
         val header = readHeader(input)
         val lines = header.split("\r\n")
-        val path = lines.first().split(' ').getOrNull(1) ?: error("Invalid request line")
+        val parts = lines.first().split(' ')
+        val method = parts.getOrNull(0) ?: error("Invalid request line: missing method")
+        val path = parts.getOrNull(1) ?: error("Invalid request line: missing path")
         val headers = lines.drop(1).mapNotNull { line ->
             val colon = line.indexOf(':')
             if (colon <= 0) null else line.substring(0, colon).trim().lowercase() to line.substring(colon + 1).trim()
         }.toMap()
-        return Request(path, headers, input)
+        return Request(method, path, headers, input)
     }
 
     private fun readHeader(input: InputStream): String {
