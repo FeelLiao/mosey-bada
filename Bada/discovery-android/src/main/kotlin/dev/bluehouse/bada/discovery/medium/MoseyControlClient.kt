@@ -179,6 +179,8 @@ public data class MoseyStatus(
     val wifiConnected: Boolean,
     val mosey0Exists: Boolean,
     val wonderLoaded: Boolean,
+    val countryCode: String?,
+    val countryMode: String?,
 ) {
     internal companion object {
         private const val TAG = "MoseyStatus"
@@ -193,6 +195,19 @@ public data class MoseyStatus(
                 val rest = json.substring(colon + 1).trimStart()
                 rest.startsWith("true")
             }
+            fun string(key: String): String? {
+                val idx = json.indexOf("\"$key\"")
+                if (idx < 0) return null
+                val colon = json.indexOf(':', idx + key.length + 2)
+                if (colon < 0) return null
+                val rest = json.substring(colon + 1).trimStart()
+                // Extract value between quotes after the colon
+                val start = rest.indexOf('"')
+                if (start < 0) return null
+                val end = rest.indexOf('"', start + 1)
+                if (end < 0) return null
+                return rest.substring(start + 1, end)
+            }
             return MoseyStatus(
                 enabled = bool("enabled"),
                 nativeRunning = bool("native_running"),
@@ -201,6 +216,8 @@ public data class MoseyStatus(
                 wifiConnected = bool("wifi_connected"),
                 mosey0Exists = bool("mosey0_exists"),
                 wonderLoaded = bool("wonder_loaded"),
+                countryCode = string("country_code"),
+                countryMode = string("country_mode"),
             )
         }
     }

@@ -12,6 +12,12 @@ SHIM_PAYLOAD="$MODPATH/payload/MoseyBridgeShim.apk"
 BASE_SHIM_VERSION=29
 UPDATED_SHIM_VERSION=30
 SESSION_FILE="$STATE_DIR/install-session.id"
+
+# ── Mosey 固定监管域 ──
+# 只传递给 Mosey shim/bridge，不修改 Android 全局 Wi-Fi 国家码。
+MOSEY_COUNTRY_CODE="CN"
+MOSEY_COUNTRY_MODE="fixed"
+COUNTRY_CODE_FILE="$STATE_DIR/country_code"
 WATCHDOG_PID_FILE="$STATE_DIR/watchdog.pid"
 WATCHDOG_LOCK="$STATE_DIR/watchdog.lock"
 OPERATION_LOCK="$STATE_DIR/operation.lock"
@@ -197,6 +203,27 @@ valid_country_code() {
     return 0
 }
 
+# ── 原子写入固定国家码 ──
+# 使用临时文件 + 同目录 mv 避免直接重定向导致空文件。
+persist_mosey_country_code() {
+    local CURRENT TMP
+    if ! valid_country_code "$MOSEY_COUNTRY_CODE"; then
+        log_msg "[x] Invalid fixed Mosey country code: $MOSEY_COUNTRY_CODE"
+        return 1
+    fi
+    CURRENT=$(cat "$COUNTRY_CODE_FILE" 2>/dev/null)
+    [ "$CURRENT" = "$MOSEY_COUNTRY_CODE" ] && return 0
+    TMP="$STATE_DIR/.country_code.$$"
+    (
+        umask 077
+        printf '%s\n' "$MOSEY_COUNTRY_CODE" > "$TMP"
+    ) || { rm -f "$TMP"; log_msg "[x] Failed to write temporary country-code file"; return 1; }
+    chmod 600 "$TMP" 2>/dev/null || { rm -f "$TMP"; log_msg "[x] Failed to set country-code file permissions"; return 1; }
+    mv -f "$TMP" "$COUNTRY_CODE_FILE" || { rm -f "$TMP"; log_msg "[x] Failed to install fixed country-code file"; return 1; }
+    log_msg "[+] Mosey country persisted: country=$MOSEY_COUNTRY_CODE mode=$MOSEY_COUNTRY_MODE"
+    return 0
+}
+
 normalize_country_value() {
     echo "$1" | cut -d, -f1 | tr 'a-z' 'A-Z' \
         | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | cut -c1-2
@@ -272,75 +299,31 @@ stable_country_code() {
 prepare_radio_dependencies() {
     local TRY
 
-    # ── LOWI 只需要启动一次 ──
+    # 先验证固定配置，避免等待 LOWI 后才发现配置错误。
+    valid_country_code "$MOSEY_COUNTRY_CODE" || {
+        log_msg "[x] Invalid configured Mosey country: $MOSEY_COUNTRY_CODE"
+        return 1
+    }
+
     if ! check_lowi; then
         log_msg "[*] Starting Qualcomm LOWI dependency"
         start lowi-server >/dev/null 2>&1 || setprop ctl.start lowi-server
     fi
+
     for TRY in $(seq 1 20); do
         check_lowi && break
         sleep 1
     done
+
     if ! check_lowi; then
         log_msg "[x] LOWI dependency did not reach running state"
         return 1
     fi
 
-    # ── 如果 Wi-Fi 已关闭（Mosey 已启用状态），跳过 country-code 检查 ──
-    # 直接用缓存的国家码
-    if ! dumpsys wifi 2>/dev/null | grep -q 'Wi-Fi is enabled'; then
-        local CACHED
-        CACHED=$(cat "$STATE_DIR/country_code" 2>/dev/null)
-        if valid_country_code "$CACHED"; then
-            log_msg "[+] Radio dependencies ready: LOWI=running country=$CACHED (cached, Wi-Fi off)"
-            return 0
-        fi
-        # 缓存过期但仍可用；用 CN 默认值
-        echo "CN" > "$STATE_DIR/country_code"
-        chmod 600 "$STATE_DIR/country_code" 2>/dev/null
-        log_msg "[+] Radio dependencies ready: LOWI=running country=CN (default, Wi-Fi off)"
-        return 0
-    fi
+    persist_mosey_country_code || return 1
 
-    # ── Wi-Fi 启用中：清除国家码覆盖，获取稳定国家码 ──
-    cmd wifi force-country-code disabled >/dev/null 2>&1 || {
-        log_msg "[w] Unable to disable Wi-Fi country override; continuing"
-    }
-    local COUNTRY_RESULT COUNTRY SOURCE DRIVER FRAMEWORK TELEPHONY OVERRIDE
-    local LAST_COUNTRY="" STABLE_COUNT=0
-    for TRY in $(seq 1 30); do
-        COUNTRY_RESULT=$(read_wifi_country)
-        COUNTRY=${COUNTRY_RESULT%%|*}
-        SOURCE=${COUNTRY_RESULT#*|}
-        DRIVER=$(read_wifi_field mDriverCountryCode)
-        FRAMEWORK=$(read_wifi_field mFrameworkCountryCode)
-        TELEPHONY=$(read_wifi_field mTelephonyCountryCode)
-        OVERRIDE=$(dumpsys wifi 2>/dev/null \
-            | sed -n 's/^[[:space:]]*mOverrideCountryCode:[[:space:]]*//p' | tail -n 1)
-        if valid_country_code "$COUNTRY"; then
-            [ -n "$DRIVER" ] && valid_country_code "$DRIVER" \
-                && [ "$DRIVER" != "$COUNTRY" ] && STABLE_COUNT=0 && sleep 1 && continue
-            [ -n "$FRAMEWORK" ] && valid_country_code "$FRAMEWORK" \
-                && [ "$FRAMEWORK" != "$COUNTRY" ] && STABLE_COUNT=0 && sleep 1 && continue
-            [ -n "$OVERRIDE" ] && [ "$OVERRIDE" != "null" ] \
-                && STABLE_COUNT=0 && sleep 1 && continue
-            if [ "$COUNTRY" = "$LAST_COUNTRY" ]; then
-                STABLE_COUNT=$((STABLE_COUNT + 1))
-            else
-                LAST_COUNTRY="$COUNTRY"
-                STABLE_COUNT=1
-            fi
-            if [ "$STABLE_COUNT" -ge 3 ]; then
-                echo "$COUNTRY" > "$STATE_DIR/country_code"
-                chmod 600 "$STATE_DIR/country_code" 2>/dev/null
-                log_msg "[+] Radio dependencies ready: LOWI=running country=$COUNTRY source=$SOURCE driver=$DRIVER framework=$FRAMEWORK telephony=$TELEPHONY override=$OVERRIDE stable=3"
-                return 0
-            fi
-        fi
-        sleep 1
-    done
-    log_msg "[x] Android Wi-Fi service did not provide a valid country code"
-    return 1
+    log_msg "[+] Radio dependencies ready: LOWI=running country=$MOSEY_COUNTRY_CODE mode=$MOSEY_COUNTRY_MODE"
+    return 0
 }
 
 start_mosey_server() {
@@ -640,34 +623,48 @@ grant_bada_runtime() {
 
 start_shim() {
     prepare_radio_dependencies || return 1
-    local COUNTRY
-    COUNTRY=$(cat "$STATE_DIR/country_code" 2>/dev/null)
+
+    local COUNTRY="$MOSEY_COUNTRY_CODE"
+    local TRY ROUTE_TRY
+
     valid_country_code "$COUNTRY" || {
-        log_msg "[x] Refusing shim startup without a valid Wi-Fi country code"
+        log_msg "[x] Refusing shim startup: invalid configured country=$COUNTRY"
         return 1
     }
+
     ensure_shim_package || return 1
     grant_shim_permissions
     grant_bada_runtime
+
+    log_msg "[*] Starting Mosey shim country=$COUNTRY mode=$MOSEY_COUNTRY_MODE"
+
     am start-foreground-service -n "$SHIM_COMPONENT" \
         --es country_code "$COUNTRY" >/dev/null 2>&1 \
-        || am startservice -n "$SHIM_COMPONENT" --es country_code "$COUNTRY" >/dev/null 2>&1 \
-        || cmd activity start-service "$SHIM_COMPONENT" --es country_code "$COUNTRY" >/dev/null 2>&1
-    local TRY
+        || am startservice -n "$SHIM_COMPONENT" \
+            --es country_code "$COUNTRY" >/dev/null 2>&1 \
+        || cmd activity start-service "$SHIM_COMPONENT" \
+            --es country_code "$COUNTRY" >/dev/null 2>&1
+
     for TRY in $(seq 1 15); do
-        if check_shim && dumpsys activity services "$SHIM_PKG" 2>/dev/null \
-                | grep -Eq 'types=0x0*10'; then
-            log_msg "[+] Mosey shim foreground service active type=connectedDevice country=$COUNTRY"
+        if check_shim \
+                && dumpsys activity services "$SHIM_PKG" 2>/dev/null \
+                    | grep -Eq 'types=0x0*10'; then
+
+            log_msg "[+] Mosey shim foreground service active type=connectedDevice country=$COUNTRY mode=$MOSEY_COUNTRY_MODE"
+
             for ROUTE_TRY in $(seq 1 15); do
                 ensure_mosey_ipv6_rules && return 0
                 sleep 1
             done
-            log_msg "[!] Shim is active but mosey0 IPv6 policy is not ready; watchdog will retry"
+
+            log_msg "[!] Shim active but mosey0 IPv6 policy is not ready; watchdog will retry"
             return 0
         fi
+
         sleep 1
     done
-    log_msg "[x] Mosey shim failed to enter foreground state"
+
+    log_msg "[x] Mosey shim failed to enter foreground state country=$COUNTRY"
     return 1
 }
 
@@ -696,7 +693,7 @@ run_watchdog() {
     trap 'rm -f "$WATCHDOG_PID_FILE"; rmdir "$WATCHDOG_LOCK" 2>/dev/null' EXIT INT TERM
     log_msg "[+] Unified watchdog started pid=$$"
 
-    local BRIDGE_FAILURES=0 SHIM_FAILURES=0 DELAY PID COUNTRY ACTIVE_COUNTRY
+    local BRIDGE_FAILURES=0 SHIM_FAILURES=0 DELAY PID
     while true; do
         sleep 30
 
@@ -748,14 +745,8 @@ run_watchdog() {
             BRIDGE_FAILURES=0
             SHIM_FAILURES=0
             ensure_mosey_ipv6_rules || true
-            COUNTRY=$(stable_country_code 2>/dev/null)
-            ACTIVE_COUNTRY=$(cat "$STATE_DIR/country_code" 2>/dev/null)
-            if valid_country_code "$COUNTRY" && [ "$COUNTRY" != "$ACTIVE_COUNTRY" ]; then
-                log_msg "[*] Wi-Fi country changed $ACTIVE_COUNTRY -> $COUNTRY; updating Mosey radio"
-                echo "$COUNTRY" > "$STATE_DIR/country_code"
-                chmod 600 "$STATE_DIR/country_code" 2>/dev/null
-                am start-foreground-service -n "$SHIM_COMPONENT" \
-                    --es country_code "$COUNTRY" >/dev/null 2>&1 || true
+            if ! persist_mosey_country_code; then
+                log_msg "[w] Watchdog failed to maintain fixed country=$MOSEY_COUNTRY_CODE"
             fi
         fi
 
@@ -826,8 +817,9 @@ webui_status() {
     [ -d /sys/class/net/mosey0 ] && MOSEY0=true
     lsmod 2>/dev/null | grep -q '^wonder ' && WONDER=true
 
-    printf '{"enabled":%s,"native_running":%s,"bridge_running":%s,"shim_running":%s,"wifi_connected":%s,"mosey0_exists":%s,"wonder_loaded":%s}\n' \
-        "$ENABLED" "$NATIVE" "$BRIDGE" "$SHIM" "$WIFI" "$MOSEY0" "$WONDER"
+    printf '{"enabled":%s,"native_running":%s,"bridge_running":%s,"shim_running":%s,"wifi_connected":%s,"mosey0_exists":%s,"wonder_loaded":%s,"country_code":"%s","country_mode":"%s"}\n' \
+        "$ENABLED" "$NATIVE" "$BRIDGE" "$SHIM" "$WIFI" "$MOSEY0" "$WONDER" \
+        "$MOSEY_COUNTRY_CODE" "$MOSEY_COUNTRY_MODE"
 }
 
 webui_enable() {

@@ -95,6 +95,7 @@ public class StatusRepository private constructor(
                         shimRunning = moseyStatus.shimRunning,
                         wifiConnected = moseyStatus.wifiConnected,
                         mosey0Exists = moseyStatus.mosey0Exists,
+                        bridgeReachable = true,
                         lastBridgeUpdate = System.currentTimeMillis(),
                     )
                 } else {
