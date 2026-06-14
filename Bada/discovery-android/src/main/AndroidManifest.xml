@@ -1,0 +1,147 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  :discovery-android module manifest.
+
+  These permissions are required by the NsdManager-backed publish + browse
+  code (#18, migrated from JmDNS in #98), the BLE service-data advertiser
+  added in #32, and the BLE pulse scanner added in #33. They are declared
+  at the library level so any consuming app automatically inherits them;
+  the umbrella set in :app/AndroidManifest.xml remains authoritative for
+  the runtime-prompt entries (NEARBY_WIFI_DEVICES, BLUETOOTH_ADVERTISE,
+  BLUETOOTH_SCAN, etc.) and is the single place that declares user-visible
+  permission rationales.
+
+  Note: CHANGE_WIFI_MULTICAST_STATE was previously required for the JmDNS
+  in-app publisher (it acquired a WifiManager.MulticastLock to keep mDNS
+  multicast flowing while the screen was off). After the #98 migration to
+  NsdManager, the system mDNS responder process handles all multicast
+  inbound for us and the in-app multicast lock is no longer needed.
+
+  Compile-time (no runtime prompt):
+    * ACCESS_WIFI_STATE — needed to obtain WifiManager via getSystemService
+      on every API level we support, used by NetworkChangeWatcher to
+      observe Wi-Fi network transitions.
+    * ACCESS_NETWORK_STATE — required by NetworkChangeWatcher to register
+      a ConnectivityManager.NetworkCallback.
+
+  Runtime (must be granted by the user on API 31+):
+    * BLUETOOTH_ADVERTISE — required by BleAdvertiser (#32) to broadcast
+      the sender-side BLE service-data pulse that wakes nearby Quick Share
+      receivers. Onboarding (#31) prompts for the runtime grant; this
+      manifest line makes the requirement library-local so consumers cannot
+      accidentally compile against the BleAdvertiser API without declaring
+      the permission.
+    * BLUETOOTH_SCAN — required by BleQuickShareScanner (#33) to listen
+      for sender BLE pulses. neverForLocation tells Android we never
+      derive physical location from BLE scan results, so the platform
+      skips the ACCESS_FINE_LOCATION requirement that would otherwise
+      apply on API 31+.
+
+  Legacy (API <= 30 only):
+    * BLUETOOTH / BLUETOOTH_ADMIN — declared with maxSdkVersion=30 so that
+      pre-Android-12 devices still have install-time grants for the BLE
+      scan/advertise APIs while API 31+ devices use the runtime permission.
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+
+    <uses-permission
+        android:name="android.permission.BLUETOOTH_ADVERTISE"
+        tools:targetApi="31" />
+
+    <uses-permission
+        android:name="android.permission.BLUETOOTH_SCAN"
+        android:usesPermissionFlags="neverForLocation"
+        tools:targetApi="31" />
+
+    <!--
+      BLUETOOTH_CONNECT — required by:
+        * BluetoothRfcommMediumProvider (#51) to open the receiver-side
+          RFCOMM listener via listenUsingInsecureRfcommWithServiceRecord
+          and to issue the sender-side
+          createInsecureRfcommSocketToServiceRecord(...).connect().
+          Quoting Android docs: BLUETOOTH_CONNECT covers "communicating
+          with already-paired Bluetooth devices" — RFCOMM connect/accept
+          is in that bucket regardless of whether we go through the OS
+          pairing dance (we use the *insecure* variants so no pairing
+          prompt fires, but the runtime permission is still required by
+          the platform on API 31+).
+        * BleL2capMediumProvider (#52, API 29+) to call
+          BluetoothAdapter.listenUsingInsecureL2capChannel on the
+          receiver side and BluetoothDevice.createInsecureL2capChannel
+          on the sender side.
+      Runtime grant on API 31+; the legacy BLUETOOTH/BLUETOOTH_ADMIN
+      permissions below cover API 30 and below, where the install-time
+      model still applies.
+    -->
+    <uses-permission
+        android:name="android.permission.BLUETOOTH_CONNECT"
+        tools:targetApi="31" />
+
+    <uses-permission
+        android:name="android.permission.BLUETOOTH"
+        android:maxSdkVersion="30" />
+    <uses-permission
+        android:name="android.permission.BLUETOOTH_ADMIN"
+        android:maxSdkVersion="30" />
+
+    <!--
+      Wi-Fi family bandwidth-upgrade mediums (#49 Wi-Fi Direct, #50
+      Wi-Fi local-only hotspot, #53 Wi-Fi Aware).
+
+      Compile-time:
+        * CHANGE_WIFI_STATE — required by:
+          - WifiManager.startLocalOnlyHotspot (sender role,
+            AndroidLocalOnlyHotspotController, #50) on API 26+;
+          - WifiP2pManager.createGroup / connect (#49);
+          - ConnectivityManager.requestNetwork with a
+            WifiAwareNetworkSpecifier (#53), so the framework can
+            pick a Wi-Fi Aware network on our behalf.
+
+      Runtime (must be granted by the user on API 26+):
+        * ACCESS_FINE_LOCATION — historically required by
+          WifiManager.startLocalOnlyHotspot on API 26+ for the SSID /
+          passphrase to surface in the LocalOnlyHotspotReservation
+          callback (#50). NEARBY_WIFI_DEVICES (API 33+) may substitute
+          on newer devices; the permission gate in
+          AndroidLocalOnlyHotspotController.hasRequiredPermissions
+          accepts either grant.
+        * NEARBY_WIFI_DEVICES — declared with neverForLocation so the
+          platform skips the location-tag enforcement on API 33+
+          devices where it can substitute for ACCESS_FINE_LOCATION on
+          the local-only-hotspot path, and is the preferred grant for
+          Wi-Fi Direct discovery (#49) and Wi-Fi Aware
+          publish/subscribe (#53).
+
+      Onboarding (#20 / #31) requests the runtime permissions; these
+      manifest declarations make the requirements library-local so a
+      consumer cannot accidentally compile against the providers
+      without declaring them at the app level.
+    -->
+    <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <uses-permission
+        android:name="android.permission.NEARBY_WIFI_DEVICES"
+        android:usesPermissionFlags="neverForLocation"
+        tools:targetApi="33" />
+
+    <!--
+      Hardware-feature hints for the optional bandwidth-upgrade
+      mediums. All marked `required="false"` because they are
+      *bandwidth upgrades* — devices without these chipsets still
+      function over Wi-Fi LAN. The matching availability classes
+      (WifiDirectAvailability / WifiAwareAvailability) check the
+      PackageManager features at runtime to decide whether to
+      advertise the medium in the supported-mediums set.
+    -->
+    <uses-feature
+        android:name="android.hardware.wifi.aware"
+        android:required="false" />
+    <uses-feature
+        android:name="android.hardware.wifi.direct"
+        android:required="false" />
+
+</manifest>

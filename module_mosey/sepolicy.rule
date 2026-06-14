@@ -1,0 +1,37 @@
+# sepolicy.rule - Mosey Enabler SELinux 规则
+# 允许 ksu 域 (service.sh 启动的进程) 注册 mosey_service binder
+# CN ROM 已预置 mosey_service 上下文映射, 无需额外 vendor_service_contexts
+
+# ksu 域 → servicemanager: 允许 add/find mosey_service
+allow ksu servicemanager binder { call transfer };
+allow ksu mosey_service binder { call transfer };
+allow ksu mosey_service service_manager { add find };
+
+# mosey_server 需要 raw socket 权限 (PF_PACKET for 802.11)
+allow ksu self:packet_socket { create bind ioctl read write };
+allow ksu self:netlink_route_socket { create bind read write nlmsg_write };
+
+# NL80211 命令权限 (cfg80211 vendor commands)
+allow ksu self:netlink_generic_socket { create bind read write };
+allow ksu vendor_wifi_prop:property_service set;
+
+# WiFi 接口管理 (创建 wonder0 monitor 接口)
+allow ksu self:udp_socket { create ioctl };
+allow ksu self:tcp_socket { create ioctl };
+allow ksu self:socket_device:chr_file { read write ioctl };
+
+# Binder IPC - 允许 mosey_server 与 system_server 通信
+allow ksu system_server:binder { call transfer };
+allow ksu system_server:fd use;
+allow ksu appdomain:fd use;
+
+# 读取系统属性
+allow ksu system_prop:property_service set;
+allow ksu default_prop:property_service set;
+
+# 网络接口访问
+allow ksu self:netlink_socket { create bind read write getattr };
+allow ksu wifi_data_file:file { read write };
+
+# 允许 ksu 域执行 mosey_server 二进制
+allow ksu ksu:file { execute execute_no_trans };

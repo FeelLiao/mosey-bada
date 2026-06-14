@@ -1,0 +1,7 @@
+<manifest version="1.0" type="device">
+    <hal format="aidl">
+        <name>com.google.android.moseyservice</name>
+        <version>1</version>
+        <fqname>IMoseyService/default</fqname>
+    </hal>
+</manifest>

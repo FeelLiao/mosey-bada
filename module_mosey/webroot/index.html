@@ -1,0 +1,369 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Mosey: AirDrop for Bada</title>
+<style>
+  :root {
+    --bg: #1a1a2e;
+    --card: #16213e;
+    --accent: #0f3460;
+    --green: #00c853;
+    --red: #ff1744;
+    --gray: #546e7a;
+    --text: #e0e0e0;
+    --text-dim: #9e9e9e;
+    --radius: 12px;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    padding: 16px;
+    min-height: 100vh;
+  }
+  .card {
+    background: var(--card);
+    border-radius: var(--radius);
+    padding: 20px;
+    margin-bottom: 16px;
+  }
+  h1 {
+    font-size: 20px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+  h1 small {
+    font-size: 13px;
+    color: var(--text-dim);
+    font-weight: 400;
+  }
+  .switch-container {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin: 16px 0 8px;
+  }
+  .switch-label {
+    font-size: 16px;
+    font-weight: 600;
+  }
+  .switch {
+    position: relative;
+    width: 56px;
+    height: 30px;
+    background: var(--gray);
+    border-radius: 15px;
+    cursor: pointer;
+    transition: background 0.3s;
+    flex-shrink: 0;
+  }
+  .switch.on { background: var(--green); }
+  .switch.loading { opacity: 0.6; pointer-events: none; }
+  .switch::after {
+    content: '';
+    position: absolute;
+    top: 3px; left: 3px;
+    width: 24px; height: 24px;
+    background: white;
+    border-radius: 50%;
+    transition: transform 0.3s;
+  }
+  .switch.on::after { transform: translateX(26px); }
+
+  .status-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 8px;
+    margin-top: 12px;
+  }
+  .status-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 13px;
+    padding: 6px 8px;
+    background: rgba(255,255,255,0.04);
+    border-radius: 8px;
+  }
+  .status-dot {
+    width: 8px; height: 8px;
+    border-radius: 50%;
+    flex-shrink: 0;
+  }
+  .dot-up   { background: var(--green); }
+  .dot-down { background: var(--red); }
+  .dot-na   { background: var(--gray); }
+
+  .log-box {
+    background: #0d0d1a;
+    border-radius: 8px;
+    padding: 10px;
+    font-family: 'SF Mono', 'Cascadia Code', monospace;
+    font-size: 11px;
+    line-height: 1.5;
+    max-height: 200px;
+    overflow-y: auto;
+    white-space: pre-wrap;
+    word-break: break-all;
+    color: #a8d8ea;
+    margin-top: 8px;
+  }
+  .log-box:empty::before {
+    content: '暂无日志';
+    color: var(--text-dim);
+  }
+
+  .btn {
+    background: var(--accent);
+    border: none;
+    color: var(--text);
+    padding: 8px 16px;
+    border-radius: 8px;
+    font-size: 13px;
+    cursor: pointer;
+    transition: opacity 0.2s;
+  }
+  .btn:active { opacity: 0.7; }
+
+  .toast {
+    position: fixed;
+    bottom: 24px; left: 50%;
+    transform: translateX(-50%);
+    background: #333;
+    color: white;
+    padding: 10px 20px;
+    border-radius: 8px;
+    font-size: 13px;
+    z-index: 999;
+    opacity: 0;
+    transition: opacity 0.3s;
+    pointer-events: none;
+    text-align: center;
+    max-width: 90%;
+  }
+  .toast.show { opacity: 1; }
+
+  .footer {
+    text-align: center;
+    font-size: 11px;
+    color: var(--text-dim);
+    margin-top: 24px;
+  }
+  .footer a { color: var(--accent); }
+
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg: #f5f5f5;
+      --card: #ffffff;
+      --accent: #1976d2;
+      --text: #212121;
+      --text-dim: #757575;
+    }
+    .log-box { background: #f0f0f0; color: #1a237e; }
+    .status-item { background: rgba(0,0,0,0.04); }
+  }
+</style>
+</head>
+<body>
+  <div class="card">
+    <h1>🛩️ Mosey: AirDrop <small>v1.30</small></h1>
+    <p style="font-size:13px;color:var(--text-dim);margin-top:4px;">
+      Bada AWDL 发现桥接 &middot; 启用后自动断开 Wi-Fi
+    </p>
+
+    <div class="switch-container">
+      <span class="switch-label" id="switchLabel">Mosey 服务</span>
+      <div class="switch" id="mainSwitch" onclick="toggleMosey()"></div>
+    </div>
+    <div id="switchSub" style="font-size:12px;color:var(--text-dim);margin-bottom:4px;">检测中...</div>
+
+    <div class="status-grid" id="statusGrid">
+      <div class="status-item"><span class="status-dot dot-na"></span> mosey_server</div>
+      <div class="status-item"><span class="status-dot dot-na"></span> mosey_bridge</div>
+      <div class="status-item"><span class="status-dot dot-na"></span> shim</div>
+      <div class="status-item"><span class="status-dot dot-na"></span> Wi-Fi</div>
+      <div class="status-item"><span class="status-dot dot-na"></span> mosey0</div>
+      <div class="status-item"><span class="status-dot dot-na"></span> wonder.ko</div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div style="display:flex;justify-content:space-between;align-items:center;">
+      <span style="font-size:14px;font-weight:600;">📋 最近日志</span>
+      <button class="btn" onclick="loadLog()">刷新日志</button>
+    </div>
+    <div class="log-box" id="logBox"></div>
+  </div>
+
+  <div class="footer">
+    基于 KernelSU WebUI &middot;
+    <a href="#" onclick="refreshAll()">刷新状态</a>
+  </div>
+
+  <div class="toast" id="toast"></div>
+
+<script>
+// ── KernelSU JS Bridge ──
+// KernelSU 将原生 API 注入为 window.ksu（不是 window.KernelSU！）
+// ksu.exec(cmd) 同步返回 stdout; ksu.exec(cmd, options, cb) 异步回调
+const KSU = window.ksu || {};
+
+function ksuExec(cmd) {
+  // 返回 Promise<{errno, stdout, stderr}>
+  // 使用异步回调版本获取完整返回信息
+  return new Promise(function(resolve) {
+    try {
+      if (typeof KSU.exec !== 'function') {
+        resolve({ errno: -1, stdout: '', stderr: 'KernelSU exec not available' });
+        return;
+      }
+      var cbName = 'ksu_cb_' + Date.now() + '_' + Math.floor(Math.random() * 99999);
+      window[cbName] = function(errno, stdout, stderr) {
+        resolve({ errno: errno || 0, stdout: stdout || '', stderr: stderr || '' });
+        delete window[cbName];
+      };
+      KSU.exec(cmd, JSON.stringify({}), cbName);
+      // 30秒超时保护（webui enable 需要启动 LOWI+获取国家码）
+      setTimeout(function() {
+        if (window[cbName]) {
+          window[cbName](-1, '', 'Command timed out after 30s');
+        }
+      }, 30000);
+    } catch (e) {
+      resolve({ errno: -1, stdout: '', stderr: String(e) });
+    }
+  });
+}
+
+function ksuToast(msg) {
+  try {
+    if (typeof KSU.toast === 'function') KSU.toast(msg);
+  } catch(e) {}
+}
+
+// ── DOM references ──
+var mainSwitch  = document.getElementById('mainSwitch');
+var switchLabel = document.getElementById('switchLabel');
+var switchSub   = document.getElementById('switchSub');
+var statusGrid  = document.getElementById('statusGrid');
+var logBox      = document.getElementById('logBox');
+var toastEl     = document.getElementById('toast');
+
+// ── helpers ──
+function showToast(msg) {
+  toastEl.textContent = msg;
+  toastEl.classList.add('show');
+  setTimeout(function() { toastEl.classList.remove('show'); }, 3000);
+  ksuToast(msg);
+}
+
+function setDot(el, state) {
+  var dot = el.querySelector('.status-dot');
+  if (!dot) return;
+  dot.className = 'status-dot';
+  if (state === true) dot.classList.add('dot-up');
+  else if (state === false) dot.classList.add('dot-down');
+  else dot.classList.add('dot-na');
+}
+
+// ── parse status JSON from mosey-control.sh ──
+function refreshAll() {
+  ksuExec('/data/adb/modules/mosey-enabler/mosey-control.sh webui status').then(function(res) {
+    if (res.errno !== 0) {
+      showToast('状态查询失败: ' + (res.stderr || res.stdout).slice(0, 80));
+      return;
+    }
+    try {
+      renderStatus(JSON.parse(res.stdout));
+    } catch(e) {
+      showToast('状态解析失败: ' + e.message);
+    }
+  });
+  return false; // for onclick
+}
+
+function renderStatus(s) {
+  // toggle switch
+  var on = s.enabled === true || s.enabled === 'true';
+  if (on) { mainSwitch.classList.add('on'); } else { mainSwitch.classList.remove('on'); }
+  switchLabel.textContent = on ? 'Mosey 已启用' : 'Mosey 已关闭';
+  switchSub.textContent = on
+    ? 'AirDrop 正在运行，Wi-Fi 已断开'
+    : '点击开关启用 AirDrop（将断开 Wi-Fi）';
+
+  // grid items
+  var items = statusGrid.querySelectorAll('.status-item');
+  var statusMap = {
+    'mosey_server':  s.native_running,
+    'mosey_bridge':  s.bridge_running,
+    'shim':          s.shim_running,
+    'Wi-Fi':         s.wifi_connected,
+    'mosey0':        s.mosey0_exists,
+    'wonder.ko':     s.wonder_loaded,
+  };
+  items.forEach(function(el) {
+    for (var name in statusMap) {
+      if (!statusMap.hasOwnProperty(name)) continue;
+      if (el.textContent.indexOf(name) !== -1) {
+        setDot(el, statusMap[name]);
+        if (name === 'Wi-Fi') {
+          el.innerHTML = '<span class="status-dot"></span> Wi-Fi ' + (statusMap[name] === true ? '已连接' : '已断开');
+        } else if (name === 'mosey0') {
+          el.innerHTML = '<span class="status-dot"></span> mosey0 ' + (statusMap[name] === true ? '存在' : '不存在');
+        }
+        break;
+      }
+    }
+  });
+}
+
+// ── toggle ──
+var toggling = false;
+function toggleMosey() {
+  if (toggling) return;
+  toggling = true;
+  mainSwitch.classList.add('loading');
+
+  var currentlyOn = mainSwitch.classList.contains('on');
+  var action = currentlyOn ? 'disable' : 'enable';
+  var verb = currentlyOn ? '关闭' : '开启';
+
+  switchSub.textContent = '正在' + verb + ' Mosey...';
+  ksuExec('/data/adb/modules/mosey-enabler/mosey-control.sh webui ' + action).then(function(res) {
+    if (res.errno === 0) {
+      showToast('Mosey ' + verb + '成功');
+      refreshAll();
+    } else {
+      showToast(verb + '失败: ' + (res.stderr || res.stdout).slice(0, 60));
+      if (currentlyOn) { mainSwitch.classList.add('on'); } else { mainSwitch.classList.remove('on'); }
+      switchSub.textContent = '操作失败，请重试';
+    }
+    mainSwitch.classList.remove('loading');
+    toggling = false;
+  });
+}
+
+// ── logs ──
+function loadLog() {
+  logBox.textContent = '加载中...';
+  ksuExec('/data/adb/modules/mosey-enabler/mosey-control.sh webui log').then(function(res) {
+    if (res.errno === 0 && res.stdout && res.stdout.trim()) {
+      logBox.textContent = res.stdout;
+    } else {
+      logBox.textContent = '(无日志 / 模块尚未运行)';
+    }
+  });
+  return false; // for onclick
+}
+
+// ── auto-load on startup ──
+refreshAll();
+loadLog();
+
+</script>
+</body>
+</html>

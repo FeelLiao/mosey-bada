@@ -1,0 +1,6 @@
+id=mosey-enabler
+name=Mosey: AirDrop for Bada
+version=1.30
+versionCode=31
+author=feelliao
+description=Enables the Mosey AWDL radio and AirDrop discovery bridge for Bada on the CN ROM. WebUI with on/off switch and Wi-Fi auto-management.

@@ -1,0 +1,111 @@
+name: Release
+
+# This workflow is intentionally separate from CI. Tag pushes are the single
+# source of truth for release binaries so we build each version exactly once.
+# The normal pull-request CI workflow remains unchanged.
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-read-only: true
+
+      - name: Decode release keystore
+        env:
+          KEYSTORE_B64: ${{ secrets.KEYSTORE_B64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          missing=()
+          for name in KEYSTORE_B64 KEYSTORE_PASSWORD KEY_ALIAS KEY_PASSWORD; do
+            if [ -z "${!name}" ]; then
+              missing+=("$name")
+            fi
+          done
+
+          if [ "${#missing[@]}" -ne 0 ]; then
+            printf 'Missing required release signing secret(s): %s\n' "${missing[*]}" >&2
+            exit 1
+          fi
+
+          printf '%s' "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/release.keystore"
+          chmod 600 "$RUNNER_TEMP/release.keystore"
+
+      - name: Build signed release APK
+        env:
+          KEYSTORE_FILE: ${{ runner.temp }}/release.keystore
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: ./gradlew :app:assembleRelease --refresh-dependencies --stacktrace
+
+      - name: Resolve signed APK path
+        id: release_apk
+        shell: bash
+        run: |
+          shopt -s nullglob
+          apks=(app/build/outputs/apk/release/*.apk)
+          if [ "${#apks[@]}" -ne 1 ]; then
+            printf 'Expected exactly one release APK, found %s\n' "${#apks[@]}" >&2
+            printf 'Matches: %s\n' "${apks[*]:-<none>}" >&2
+            exit 1
+          fi
+
+          apk_path="${apks[0]}"
+          apk_name="$(basename "$apk_path")"
+          printf 'apk_path=%s\n' "$apk_path" >> "$GITHUB_OUTPUT"
+          printf 'apk_name=%s\n' "$apk_name" >> "$GITHUB_OUTPUT"
+
+      - name: Remove decoded keystore
+        if: always()
+        run: rm -f "${{ runner.temp }}/release.keystore"
+
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.release_apk.outputs.apk_name }}
+          if-no-files-found: error
+          path: ${{ steps.release_apk.outputs.apk_path }}
+
+      - name: Attach assets to matching GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          release_tag="${GITHUB_REF_NAME}"
+          repo="${GITHUB_REPOSITORY}"
+
+          for attempt in $(seq 1 12); do
+            if gh release view "$release_tag" --repo "$repo" >/dev/null 2>&1; then
+              gh release upload "$release_tag" \
+                --repo "$repo" \
+                "${{ steps.release_apk.outputs.apk_path }}" \
+                --clobber
+              exit 0
+            fi
+
+            sleep 5
+          done
+
+          echo "::warning::No GitHub Release found for ${release_tag}; artifacts remain on the workflow run only."

@@ -1,0 +1,7 @@
+# mosey_server: do NOT auto-start at boot.
+service mosey_server /odm/bin/mosey_server
+    interface aidl com.google.android.moseyservice.IMoseyService/default
+    user system
+    group system inet
+    disabled
+    capabilities NET_ADMIN NET_RAW
