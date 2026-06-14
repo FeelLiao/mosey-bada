@@ -1,441 +1,458 @@
+# Mosey Extended
 
+> **Experimental & In Active Development. For research purposes only.**
 
-# English
+A KernelSU module that enables AWDL (Apple Wireless Direct Link) discovery and AirDrop-compatible file transfer on non-Pixel Android devices. This project provides the native bridge, BLE scanning shim, and control infrastructure needed to run `mosey_server` — the Rust binary that handles Apple AWDL radio discovery via NL80211 and a Qualcomm `wonder.ko` driver.
 
-> [!CAUTION]
-> **EXPERIMENTAL AND IN ACTIVE DEVELOPMENT!**
-> 
-> **FLASH ANY MODULES AT YOUR OWN RISK!** You **MUST** know exactly what you are doing.  
-> For research and debugging purposes only.  
+---
 
 ## Table of Contents
 
-1. [What is this?](#1-what-is-this)
-2. [How AirDrop (mosey) works — full stack](#2-how-airdrop-mosey-works--full-stack)
-3. [Full modification tree](#3-full-modification-tree)
-4. [Supported devices & Wi-Fi modems](#4-supported-devices--wi-fi-modems)
-5. [Key files location table](#5-key-files-location-table)
-6. [Current status](#6-current-status)
-7. [Build: wonder\_mosey\_wild.ko](#7-build-wonder_mosey_wildko)
-8. [Deployment & service.sh integration](#8-deployment--servicesh-integration)
-9. [Known limitations](#9-known-limitations)
+- [Overview](#overview)
+- [Architecture](#architecture)
+- [Project Structure](#project-structure)
+- [Building](#building)
+- [Deployment](#deployment)
+- [Bridge Protocol API](#bridge-protocol-api)
+- [Control Interface API](#control-interface-api)
+- [Boot Sequence](#boot-sequence)
+- [Source Code Reference](#source-code-reference)
+- [Known Limitations](#known-limitations)
 
 ---
 
-## 1. What is this?
+## Overview
 
-A few weeks ago, I reverse-engineered a Pixel 10 firmware image and identified
-the missing component required to enable AirDrop-style functionality in Google
-Quick Share on older Pixel devices — and potentially any Android device.
+This project provides everything needed to bring Apple AirDrop-style AWDL discovery to Android devices with a Qualcomm WiFi chipset and KernelSU root:
 
-I found a native binary named **`mosey_server`** (matching the APK extension
-component for Quick Share). Static analysis shows it is a native Android
-service, not a CLI tool. It links against `libbinder_ndk.so`, `liblog.so`,
-`libc.so`, and `libdl.so`, and contains the string
-`AServiceManager_addService`. The embedded source path
-`vendor/google/services/QuickShareExtension/src/server.rs` confirms it is part
-of the Quick Share extension and is expected to start at boot.
+| Component | What it does |
+|-----------|--------------|
+| **KSU module** (`module_mosey/`) | An installable KernelSU module that injects `mosey_server`, `mosey_bridge`, and `MoseyBridgeShim` into the system via magic mount |
+| **mosey_bridge** (C) | A TCP↔Binder bridge daemon that lets Android apps (running as `untrusted_app`) send commands to `mosey_server` (running as root) over loopback TCP |
+| **MoseyBridgeShim** (Java APK) | A privileged Android app that provides a foreground service with BLE scanning, AWDL HTTPS listener, and event forwarding |
+| **mosey-control.sh** | Shell-based control interface for enabling/disabling mosey, checking status, and automatic watchdog |
+| **Build infrastructure** | `build.sh` compiles all C sources, Java shim, and APK into a single KSU module zip |
 
-The binary attempts to register a native AIDL (NDK Binder) service via
-`AServiceManager_addService("com.google.pixel.service.IService/default")`.
-
-Initial attempts to inject and run this binary via KSU module failed because:
-1. `AServiceManager_addService()` requires more than just SELinux `allow` rules.
-2. The service name must be mapped to a valid SELinux service type in
-   `vendor_service_contexts`.
-3. Without that mapping, registration fails with `PERMISSION_DENIED` or
-   `UNKNOWN_ERROR`.
-
-The Pixel 10 vendor image includes all required components. This project
-transplants them — along with a virtual "wonder" Wi-Fi phy — so that
-`mosey_server` can run on any rooted Android device.
+The project does **not** bundle `mosey_server` or `libmosey_daemon_ffi.so` — those must be extracted from a OnePlus GLO or Pixel vendor image.
 
 ---
 
-## 2. How AirDrop (mosey) works — full stack
-
-Google's "AirDrop" (internal codename **mosey**) in Quick Share requires a
-specific Wi-Fi interface named `wonder` to be present on the device. The
-`mosey_server` native service communicates with this interface through the
-Linux `cfg80211`/`nl80211` subsystem.
-
-The full boot sequence:
+## Architecture
 
 ```
-Boot
- └─ init parses mosey.rc
-     └─ starts mosey_server (NET_ADMIN, NET_RAW caps)
-         ├─ registers "com.google.pixel.service.IService/default" with servicemanager
-         ├─ sends NL80211_CMD_NEW_INTERFACE to create "wonder0" (MONITOR mode)
-         ├─ sets channel 149 / 5745 MHz via NL80211_CMD_SET_CHANNEL
-         ├─ sends NL80211 vendor commands (vendor_id=0x1A11):
-         │   ├─ subcmd 1: set_frequency
-         │   ├─ subcmd 2: set_filter
-         │   ├─ subcmd 3: set_fixed_tx_rate
-         │   ├─ subcmd 4: set_reg
-         │   └─ subcmd 5: get_if_mac_addr → reads 6-byte MAC
-         └─ opens PF_PACKET / TPACKET_V3 on wonder0 for 802.11 frame I/O
+                    TCP 127.0.0.1:19539
+┌─────────────────────┐      │      ┌──────────────────────┐
+│  External Client    │◄─────┴─────►│  MoseyBridgeShim     │
+│  (Bada / any app)   │             │  - FGS + BLE scan    │
+│  ┌───────────────┐  │             │  - HTTS :19541       │
+│  │ ControlClient │  │             │  - event subscriber  │
+│  │ enable/disable│  │             └──────────┬───────────┘
+│  │ status/wake   │  │                        │
+│  └───────────────┘  │                        │ BLE events
+│  ┌───────────────┐  │                        │
+│  │ SocketClient  │  │                        │
+│  │ getVersion/   │  │                        │
+│  │ start/stop/   │  │                        │
+│  │ update/sub    │  │                        │
+│  └───────┬───────┘  │                        │
+└──────────┼──────────┘                        │
+           │ TCP :19539                        │ TCP :19539
+┌──────────┴───────────────────────────────────┴──────────┐
+│  mosey_bridge (root, C/NDK)                              │
+│                                                          │
+│  ┌─ CMD_ENABLE/DISABLE/STATUS → exec mosey-control.sh  │
+│  ├─ CMD_GETVERSION/START/STOP/UPDATE → Binder → server │
+│  ├─ CMD_WAKE_BADA → broadcast to AirDropWakeReceiver   │
+│  └─ Event forwarding → all TCP subscribers              │
+└──────────────────────┬───────────────────────────────────┘
+                       │ Binder
+┌──────────────────────┴───────────────────────────────────┐
+│  mosey_server (Rust, root)                                │
+│  - Registers: com.google.android.moseyservice.IMoseyService│
+│  - dlopen("libmosey_daemon_ffi.so")                       │
+│  - PF_PACKET + NL80211 → wonder.ko → mosey0              │
+│  - AWDL BLE + 802.11 frame discovery                     │
+└──────────────────────────────────────────────────────────┘
 ```
 
-On Pixel 9 / 10, this chain works natively via the BCM4398 chip's
-`wondertap` mechanism inside `bcmdhd`. On older Pixels (7/8) and non-Pixel
-devices, this project provides the missing pieces:
+### Key design decisions
 
-- **`wonder_mosey_wild.ko`** — a standalone virtual mac80211 driver that
-  creates the `wonder` phy and handles all vendor commands natively.
-- **SELinux policy** — extracted from Pixel 10, injected via KSU `sepolicy.rule`.
-- **`mosey.rc`** — init service definition, overlaid via KSU module.
+| Decision | Rationale |
+|----------|-----------|
+| **TCP binary protocol** for app↔bridge | Simple frame format (type+length+payload), easy to implement from any language |
+| **mosey-control.sh** for enable/disable | Shell script separates control logic from C code; no recompilation needed |
+| **Async CMD_DISABLE** via fork/exec | Bridge pre-acknowledges then backgrounds the disable; avoids self-kill |
+| **Operation lock** with timeout | Prevents concurrent enable/disable races; watchdog uses non-blocking try-lock |
+| **Two-phase backend wait** | 20s socket check + 3 probe attempts; avoids blocking on Binder polling |
+| **Separate control client** | `MoseyControlClient` makes short-lived TCP connections without subscribing to events |
 
 ---
 
-## 3. Full modification tree
-
-The following tree lists every layer that must be modified or provided to
-bring AirDrop online, from high-level feature flags down to the modem driver.
-Items marked ✅ are handled by this module; ⚠️ indicates partial / in-progress;
-❌ indicates not yet implemented.
+## Project Structure
 
 ```
-AirDrop (mosey Quick Share) — Full Stack
+mosey-extended/
+├── README.md
+├── build.sh                         ← One-command module build
 │
-├── [Layer 0] Phenotype / Feature Flags                          ✅
-│   ├── pixel_experience_YYYY.xml
-│   │   └── com.google.android.feature.PIXEL_XXXX_EXPERIENCE
-│   │       declares the device as Pixel-class to GMS
-│   ├── phenotype.db
-│   │   └── NearbyShare / QuickShare feature gates
-│   └── payload/pixel_experience_*.xml
-│       └── injected via KSU module overlay (install.sh)
+├── module_mosey/                    ← KernelSU module (deployed to device)
+│   ├── module.prop                  ← Module metadata
+│   ├── customize.sh                 ← Install-time setup
+│   ├── post-fs-data.sh              ← Early boot: linker fix, file verify
+│   ├── service.sh                   ← Late boot: start mosey_server + bridge
+│   ├── boot-completed.sh            ← Post-boot: start shim FGS
+│   ├── mosey-control.sh             ← Control: enable/disable/status/watchdog
+│   ├── uninstall.sh                 ← Module removal cleanup
+│   ├── sepolicy.rule                ← SELinux rules for ksu domain
+│   ├── action.sh                    ← KernelSU action button
+│   ├── webroot/index.html           ← KernelSU WebUI
+│   ├── odm/                         ← Magic-mounts to /odm/
+│   │   ├── bin/mosey_server         ← Rust binary (external)
+│   │   ├── bin/mosey_bridge         ← C TCP↔Binder bridge
+│   │   ├── lib64/libmosey_preload.so
+│   │   ├── lib64/libmosey_daemon_ffi.so  ← (external)
+│   │   ├── framework/mosey-shim.jar
+│   │   └── etc/init/mosey.rc, vintf/, mosey-shim/
+│   ├── system_ext/                  ← Magic-mounts to /system_ext/
+│   │   └── priv-app/MoseyBridgeShim/
+│   └── payload/MoseyBridgeShim.apk
 │
-├── [Layer 1] APK / GMS                                          ✅ (GMS managed)
-│   ├── com.google.android.gms — Nearby/Quick Share core service
-│   ├── com.google.android.apps.nearby.sharewidget — Quick Share UI
-│   └── MoseyApp — vendor Quick Share extension APK
-│
-├── [Layer 2] Native Binary                                      ✅
-│   └── /vendor/bin/mosey_server
-│       ├── Language: Rust (embedded source path confirms)
-│       ├── Links: libbinder_ndk, liblog, libc, libdl
-│       └── Binder service: "com.google.pixel.service.IService/default"
-│
-├── [Layer 3] Init / Service Management                          ✅
-│   └── /vendor/etc/init/mosey.rc
-│       ├── on boot: start mosey_server
-│       ├── user system, group system inet
-│       └── capabilities: NET_ADMIN NET_RAW
-│
-├── [Layer 4] SELinux Policy                                     ✅ (partial)
-│   ├── vendor_service_contexts
-│   │   └── maps "com.google.pixel.service.IService/default" → mosey_service
-│   ├── vendor_sepolicy.cil
-│   │   └── allow rules: mosey_server domain permissions
-│   ├── vendor_file_contexts
-│   │   └── /vendor/bin/mosey_server → u:object_r:mosey_exec:s0
-│   ├── product_sepolicy.cil
-│   │   └── mosey_app domain, typeattributeset rules
-│   ├── system_ext_sepolicy.cil
-│   │   └── system_ext mosey rules
-│   ├── system_ext_seapp_contexts
-│   │   └── app package → SELinux domain mapping
-│   └── 202504.cil
-│       └── API-level compatibility mapping (API 36 / Android 16)
-│
-├── [Layer 5] Wi-Fi Interface ("wonder" phy)                    ⚠️ (build in progress)
-│   ├── cfg80211 phy named "wonder"
-│   │   └── renamed via: iw phy phyN set name wonder
-│   ├── wonder0 — MONITOR mode interface (NL80211_CMD_NEW_INTERFACE)
-│   ├── channel: 149 / 5745 MHz (5 GHz band)
-│   └── NL80211 vendor commands (vendor_id = 0x001A11):
-│       ├── subcmd 1: set_frequency  → noop (return 0)
-│       ├── subcmd 2: set_filter     → noop (return 0)
-│       ├── subcmd 3: set_fixed_tx_rate → noop (return 0)
-│       ├── subcmd 4: set_reg        → noop (return 0)
-│       └── subcmd 5: get_if_mac_addr → returns 6-byte MAC via NL attr
-│
-├── [Layer 6] Kernel Module                                      ⚠️ (build in progress)
-│   │
-│   ├── Option A — Native (Samsung wonder.ko) [Pixel 9+, S24 Exynos only]
-│   │   ├── BCM wondertap interface to bcmdhd driver
-│   │   ├── Requires: "wondertap-provider" DT phandle in device tree
-│   │   ├── Requires: BCM4398 chip + bcmdhd with wondertap symbols
-│   │   └── Available pre-built: kernel 6.1.145 (Pixel 9), 6.1.157 (S24 Exynos)
-│   │
-│   └── Option B — Standalone (wonder_mosey_wild.ko) ← THIS PROJECT
-│       ├── Virtual mac80211 driver, no hardware dependency
-│       ├── Satisfies full NL80211 init sequence natively
-│       ├── Kernel: android14-6.1-2025-09 + Wild KSU patches
-│       ├── vermagic: 6.1.145-android14-11-Wild-Exclusive
-│       └── Runs on any KSU/Magisk-rooted device (virtual phy, no real RF)
-│
-└── [Layer 7] Wi-Fi Driver / Modem Firmware                     device-specific
-    ├── BCM4398 (Pixel 9/10, Samsung Galaxy S24 Exynos)
-    │   ├── bcmdhd4390.ko with native wondertap
-    │   └── Full RF: real 802.11 frame TX/RX via wonder0
-    ├── BCM4389 (Pixel 7/8, Pixel Fold)
-    │   ├── bcmdhd without native wondertap
-    │   └── wonder_mosey_wild.ko provides virtual phy (no real RF)
-    ├── Qualcomm FastConnect (Samsung S24/S25 Snapdragon, OnePlus, etc.)
-    │   └── No wondertap; standalone virtual phy only via this module
-    └── MediaTek MT7925 (OPPO Find X8, Vivo X200, Xiaomi 15)
-        └── No wondertap; standalone virtual phy only via this module
+└── src/                             ← Source code
+    ├── bridge/
+    │   ├── mosey_bridge.c           ← TCP↔Binder bridge daemon
+    │   ├── mosey_launcher.c         ← Service pre-registration tool (legacy)
+    │   └── mosey_preload.c          ← LD_PRELOAD for AServiceManager intercept
+    └── shim/
+        ├── dl_shim.c                ← LD_PRELOAD for dlopen path redirect
+        ├── java/MoseyShim.java      ← Java shim framework
+        └── app/                     ← MoseyBridgeShim APK
+            ├── AndroidManifest.xml
+            ├── res/
+            ├── src/.../moseyshim/
+            └── stubs/android/net/   ← Hidden API stubs
 ```
 
 ---
 
-## 4. Supported devices & Wi-Fi modems
-
-> **Column key**
-> - **Native wonder** — device ships with BCM wondertap support in bcmdhd + wonder.ko
-> - **Virtual phy** — `wonder_mosey_wild.ko` can provide the wonder interface (no real RF)
-> - **mosey_server** — binary sourced from Pixel 10 vendor image; SELinux transplant required on all non-Pixel-10 devices
-
-### Google Pixel
-
-| Device name | Codename | SoC | Wi-Fi module | Native wonder | Virtual phy | Note |
-|------------|-------------|-----|-----------|:---:|:---:|------------|
-| Pixel 10 Pro XL | mustang | Tensor G5 | BCM4398 |  ✅ | ✅ | Oficiall support |
-| Pixel 10 Pro | blazer | Tensor G5 | BCM4398 | ✅ | ✅ | Oficiall support  |
-| Pixel 10 | frankel | Tensor G5 | BCM4398 |  ✅ | ✅ | Oficiall support |
-| Pixel 9 Pro XL | komodo | Tensor G4 | BCM4390 |  ✅ | ✅ | Oficiall support, bcmdhd4390.ko has wondertap |
-| Pixel 9 Pro | caiman | Tensor G4 | BCM4390 |  ✅ | ✅ | Oficiall support, bcmdhd4390.ko has wondertap |
-| Pixel 9 Pro Fold | comet | Tensor G4 | BCM4390 |  ✅ | ✅ | Oficiall support, bcmdhd4390.ko has wondertap |
-| Pixel 9 | tokay | Tensor G4 | BCM4390 | ✅ | ✅ | Oficiall support  |
-| Pixel 9a | tegu | Tensor G4 | BCM4389 | ❌ | ? | – |
-| Pixel 8 Pro | husky | Tensor G3 | BCM4389 |  ❌ | ✅ | Main target |
-| Pixel 8 | shiba | Tensor G3 | BCM4389 | ❌ | ✅ | – |
-| Pixel 8a | akita | Tensor G3 | BCM4383 | ❌ | ✅ | – |
-| Pixel 7 Pro | cheetah | Tensor G2 | BCM4389 | ❌ | ✅ | – |
-| Pixel 7 | panther | Tensor G2 | BCM4389 | ❌ | ✅ | – |
-| Pixel 7a | lynx | Tensor G2 | BCM4389 | ❌ | ✅ | – |
-| Pixel Fold | felix | Tensor G2 | BCM4389 | ❌ | ✅ | – |
-
-### Samsung Galaxy S
-
-| Device name  | SoC | Wi-Fi module |  Native wonder | Virtual phy | Note |
-|------------|-----|-----------|:---:|:---:|------------|
-| Galaxy S24 |  Exynos 2400 | BCM4398 | ✅ | ✅ | wonder.ko kernel 6.1.157 found|
-| Galaxy S24+| Exynos 2400 | BCM4398 |  ✅ | ✅ | Same as S24 Exynos |
-| Galaxy S24 |  Snapdragon 8 Gen 3 | Qualcomm WCN685x |  ✅ | ✅ | – |
-| Galaxy S24+ | Snapdragon 8 Gen 3 | Qualcomm WCN685x | | ✅ | ✅ | — |
-| Galaxy S24 Ultra |  Snapdragon 8 Gen 3 | Qualcomm WCN685x |  ✅ | ✅ | – |
-| Galaxy S25 |  Snapdragon 8 Elite | Qualcomm FastConnect 7900 | ✅ | ✅ | – |
-| Galaxy S25+ |  Snapdragon 8 Elite | Qualcomm FastConnect 7900 | ✅ | ✅ | — |
-| Galaxy S25 Ultra | Snapdragon 8 Elite | Qualcomm FastConnect 7900 |  ✅ | ✅ | — |
-
-### BBK
-
-| Device | SoC | Wi-Fi module |  Native wonder | Virtual phy | Note |
-|------------|-----|-----------|:---:|:---:|------------|
-| Vivo X300 Pro | Dimensity 9500 | MediaTek MT6993 | ✅ | ✅ | — |
-| OPPO Find X8 Pro | Dimensity 9400 | MediaTek MT7925 | ✅ | ✅ | — |
-| OPPO Find X8 Ultra | Dimensity 9400 | MediaTek MT7925 | ✅ | ✅ | — |
-
-> **Note on virtual phy**: `wonder_mosey_wild.ko` creates a valid `wonder0` interface and satisfies
-> `mosey_server`'s full NL80211 init sequence. However, without native BCM wondertap, real
-> 802.11 frame I/O will not work — proximity discovery via 802.11 scanning is unavailable.
-> BLE-based discovery may still function. This is the current limitation of all non-BCM devices.
-
----
-
-## 5. Key files location table
-
-Files relevant to mosey — sourced from the Pixel 10 vendor image unless noted.
-All paths are device-side (post-overlay).
-
-| File | Partition | Device Path | Purpose | Source |
-|------|-----------|-------------|---------|--------|
-| `mosey_server` | vendor | `/vendor/bin/mosey_server` | Native AirDrop service binary (Rust) | Pixel 10 factory image |
-| `mosey.rc` | vendor | `/vendor/etc/init/mosey.rc` | init service definition | Pixel 10 / this module |
-| `vendor_service_contexts` | vendor | `/vendor/etc/selinux/vendor_service_contexts` | Binder service → SELinux type mapping | Pixel 10 vendor image |
-| `vendor_sepolicy.cil` | vendor | `/vendor/etc/selinux/vendor_sepolicy.cil` | mosey_server allow rules | Pixel 10 vendor image |
-| `vendor_file_contexts` | vendor | `/vendor/etc/selinux/vendor_file_contexts` | `/vendor/bin/mosey_server` file label | Pixel 10 vendor image |
-| `product_sepolicy.cil` | product | `/product/etc/selinux/product_sepolicy.cil` | mosey_app domain rules | Pixel 10 product image |
-| `system_ext_sepolicy.cil` | system_ext | `/system_ext/etc/selinux/system_ext_sepolicy.cil` | system_ext mosey rules | Pixel 10 system_ext |
-| `system_ext_seapp_contexts` | system_ext | `/system_ext/etc/selinux/system_ext_seapp_contexts` | App package → SELinux domain | Pixel 10 system_ext |
-| `202504.cil` | system | `/system/etc/selinux/mapping/202504.cil` | API 36 / Android 16 compat mapping | Pixel 10 system image |
-| `compatibility_matrix.xml` | system | `/system/compatibility_matrix.device.xml` | HAL + kernel compat requirements | Pixel 10 system image |
-| `pixel_experience_YYYY.xml` | system | `/system/etc/permissions/pixel_experience_YYYY.xml` | GMS feature declarations | This module (`payload/`) |
-| `sepolicy.rule` | module | `$MODDIR/sepolicy.rule` | KSU runtime policy additions | This module |
-| `wonder_mosey_wild.ko` | vendor | `/vendor/lib/modules/wonder_mosey_wild.ko` | Virtual wonder phy kernel module | Built by `build.sh` |
-| `rename_phy` | vendor | `/vendor/bin/rename_phy` | NL80211 phy rename utility (static aarch64) | Built by `build.sh` |
-| `mosey_server.pid` | data | `/data/adb/mosey-extended/mosey_server.pid` | Runtime PID file | service.sh |
-| `service.log` | data | `/data/adb/mosey-extended/service.log` | Module boot log | service.sh |
-| `mosey_server.log` | data | `/data/adb/mosey-extended/mosey_server.log` | mosey_server stdout/stderr | service.sh |
-
-### Module file tree (KSU/Magisk overlay)
-
-```
-module root/
-├── module.prop
-├── service.sh                    ← boot-time launcher
-├── sepolicy.rule                 ← runtime SELinux rules
-├── customize.sh                  ← install-time setup
-├── uninstall.sh
-├── payload/
-│   └── pixel_experience_*.xml    ← GMS feature flags by year
-├── system/
-│   └── vendor/
-│       ├── bin/
-│       │   ├── mosey_server      ← from Pixel 10 vendor image
-│       │   └── rename_phy        ← built by build.sh
-│       ├── etc/
-│       │   └── init/
-│       │       └── mosey.rc
-│       └── lib/
-│           └── modules/
-│               └── wonder_mosey_wild.ko   ← built by build.sh
-└── agy/
-    ├── ksu_wonder_module/
-    │   └── mosey_wonder/
-    │       ├── wonder_mosey_wild.c    ← kernel module source
-    │       ├── Dockerfile.kmod        ← build environment
-    │       ├── build.sh               ← one-command builder
-    │       ├── Kbuild
-    │       └── rename_phy.c
-    └── native_poc/
-        └── native_poc_docs.md         ← BCM wondertap research
-```
-
----
-
-## 6. Current status
-
-| Component | Status | Notes |
-|-----------|--------|-------|
-| mosey_server binary (Pixel 10) | ✅ Extracted | In `system/vendor/bin/mosey_server` |
-| mosey.rc init definition | ✅ Working | `system/vendor/etc/init/mosey.rc` |
-| SELinux policy (KSU sepolicy.rule) | ✅ Working | Minimal allow rules; full CIL files still needed for production |
-| Pixel Experience feature flags | ✅ Working | `payload/pixel_experience_*.xml` injected |
-| `wonder_mosey_wild.ko` (virtual phy) | ⚠️ Building | Build6 in progress; target vermagic: `6.1.145-android14-11-Wild-Exclusive` |
-| service.sh boot launcher | ✅ Working | Waits for `sys.boot_completed`, starts mosey_server |
-| phy rename (`iw phy phyN set name wonder`) | ⚠️ Pending ko | Waits for `wonder_mosey_wild.ko` to expose `phy_index` |
-| Native BCM wondertap (Pixel 7/8) | ❌ Blocked | No wonder.ko for kernel 5.10/5.15; standalone module is the workaround |
-| Full 802.11 frame I/O | ❌ Not yet | Requires real BCM4398 hardware path (Pixel 9+ only) |
-| Non-Pixel devices | 🔬 Research | Theoretically works with KSU + virtual phy; untested |
-
-**Active development target**: Pixel 8 Pro (husky) running Wild KSU
-(`6.1.145-android14-11-Wild-Exclusive`).
-
----
-
-## 7. Build: wonder\_mosey\_wild.ko
-
-The kernel module is built inside Docker against the exact kernel source
-that Wild KSU uses, so the vermagic matches byte-for-byte.
+## Building
 
 ### Prerequisites
 
-- Docker Desktop (macOS / Linux)
-- 20 GB free disk space (Docker image is ~8 GB; first build ~15–25 min)
+| Tool | Required for |
+|------|--------------|
+| Android NDK (`aarch64-linux-android35-clang`) | Compiling `mosey_bridge`, `mosey_preload` |
+| Android SDK (`platforms/android-36`, `build-tools;36.0.0`) | `d8`, `aapt2`, `zipalign`, `apksigner` |
+| Java 8 (`javac`) | Compiling `MoseyShim.java` and shim APK |
+| OpenSSL (`openssl`) | Generating TLS keystore for shim HTTPS |
 
-### Build
+Environment variables:
+- `ANDROID_HOME` — path to Android SDK
+- `ANDROID_NDK_HOME` — path to Android NDK (optional, auto-detected from SDK)
 
-```bash
-cd agy/ksu_wonder_module/mosey_wonder
-bash build.sh
-# Output: <repo-root>/out/wonder_mosey_wild.ko
-# Expected: [+] vermagic: 6.1.145-android14-11-Wild-Exclusive SMP preempt mod_unload modversions aarch64
-```
-
-Subsequent builds use the Docker layer cache and take ~30 seconds.
-
-### Kernel environment (Dockerfile.kmod)
-
-| Item | Value |
-|------|-------|
-| Base image | `ubuntu:noble` |
-| Compiler | `clang-17` / `LLVM=1` (required for `CONFIG_KCFI_CLANG=y`) |
-| Kernel manifest | `android.googlesource.com/kernel/manifest` branch `common-android14-6.1-2025-09` |
-| Wild KSU patch | `WildKernels/kernel_patches` — `ksun-5a4a718-susfs-f7ae19ef-gki-android14-6.1.patch` |
-| EXTRAVERSION | `-android14-11` (injected via `sed` into kernel `Makefile`) |
-| CONFIG\_LOCALVERSION | `-Wild-Exclusive` (set via hardcoded `setlocalversion` script) |
-| Target vermagic | `6.1.145-android14-11-Wild-Exclusive SMP preempt mod_unload modversions aarch64` |
-
-### Building for other kernel versions
-
-| Target device | Kernel | Manifest branch | Change in Dockerfile |
-|---------------|--------|-----------------|----------------------|
-| Pixel 8 / 8 Pro (stock) | 5.15 | `android14-5.15` | Update branch + EXTRAVERSION |
-| Pixel 7 / 7 Pro | 5.10 | `android13-5.10` | Update branch + EXTRAVERSION |
-| Pixel 9 / 10 | 6.1 | `android14-6.1-2025-09` | Same as Wild KSU (no patch needed) |
-| Samsung S24 | 6.1 | Check Samsung kernel source | Different EXTRAVERSION / CONFIG\_LOCALVERSION |
-
----
-
-## 8. Deployment & service.sh integration
-
-### Push and load manually
+### Quick build
 
 ```bash
-adb push out/wonder_mosey_wild.ko /data/local/tmp/
-adb shell su -c 'insmod /data/local/tmp/wonder_mosey_wild.ko'
-
-# Verify:
-adb shell dmesg | grep wonder_mosey_wild
-# Expected: wonder_mosey_wild: phy2  MAC=6a:b0:5d:c7:27:3d  →  iw phy phy2 set name wonder
-
-# Rename phy:
-WPHY=$(adb shell su -c 'cat /sys/module/wonder_mosey_wild/parameters/phy_index')
-adb shell su -c "iw phy phy${WPHY} set name wonder"
+cd /path/to/mosey-extended
+bash build.sh [output_path.zip]
 ```
 
-### service.sh integration snippet
+The script:
+1. Compiles `mosey_bridge.c` → `module_mosey/odm/bin/mosey_bridge`
+2. Compiles `mosey_preload.c` → `module_mosey/odm/lib64/libmosey_preload.so`
+3. Compiles `MoseyShim.java` → `module_mosey/odm/framework/mosey-shim.jar`
+4. Compiles shim APK sources → `MoseyBridgeShim.apk` (base + update)
+5. Generates TLS keystore (if missing)
+6. Verifies all required files exist
+7. Packages as `mosey-enabler.zip`
 
-Add this block **before** the mosey_server launch in `service.sh`:
-
-```sh
-WONDER_KO="$MODDIR/system/vendor/lib/modules/wonder_mosey_wild.ko"
-if [ -f "$WONDER_KO" ]; then
-    insmod "$WONDER_KO"
-    /system/bin/sleep 1
-    WPHY=$(cat /sys/module/wonder_mosey_wild/parameters/phy_index 2>/dev/null)
-    if [ -n "$WPHY" ] && [ "$WPHY" -ge 0 ] 2>/dev/null; then
-        iw phy phy${WPHY} set name wonder
-    fi
-fi
-```
-
-> **Wild KSU warning**: Wild KSU's `service.sh` executor strips standalone
-> `#` comment lines before running the script. Do not add comment-only lines.
-
-### Module parameters
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `mac_addr` | `6a:b0:5d:c7:27:3d` | MAC address returned for NL80211 vendor subcmd 5. Must be locally-administered (U/L bit set). |
-| `phy_index` | read-only | phy index assigned by cfg80211. Read via `/sys/module/wonder_mosey_wild/parameters/phy_index` to call `iw phy phyN set name wonder`. |
-
-Example with custom MAC:
+### Manual steps
 
 ```bash
-insmod wonder_mosey_wild.ko mac_addr=02:ab:cd:ef:12:34
+# Build bridge
+aarch64-linux-android35-clang -O2 -Wall -Wextra \
+  -o module_mosey/odm/bin/mosey_bridge \
+  src/bridge/mosey_bridge.c -lbinder_ndk -ldl -llog -pthread
+
+# Build LD_PRELOAD
+aarch64-linux-android35-clang -O2 -Wall -Wextra -shared -fPIC \
+  -o module_mosey/odm/lib64/libmosey_preload.so \
+  src/bridge/mosey_preload.c -ldl -llog -pthread
+
+# Build Java shim
+javac -source 8 -target 8 -bootclasspath $ANDROID_JAR \
+  -d build/classes src/shim/java/MoseyShim.java
+d8 --min-api 31 --output module_mosey/odm/framework/mosey-shim.jar build/classes
 ```
 
 ---
 
-## 9. Known limitations
+## Deployment
 
-1. **No real 802.11 RF on Pixel 7/8**: `wonder_mosey_wild.ko` creates a virtual
-   phy. The `wonder0` interface exists and mosey_server's init sequence
-   completes, but no actual 802.11 frames are transmitted or received. Proximity
-   discovery via 802.11 scanning will not work. BLE-based discovery is unaffected.
+### Install the module
 
-2. **SELinux partial coverage**: `sepolicy.rule` provides the minimal rules for
-   mosey_server to start. The full vendor CIL policy from Pixel 10 is not yet
-   integrated. Some binder calls or capabilities may fail silently in enforcing
-   mode.
+```bash
+adb push mosey-enabler.zip /data/local/tmp/
+adb shell su -c 'ksud module install /data/local/tmp/mosey-enabler.zip'
+adb reboot
+```
 
-3. **mosey_server binary source**: The binary must be sourced independently from
-   a Pixel 10 vendor factory image. It is not redistributed in this module.
+### Verify
 
-4. **BCM4389 wondertap**: No wonder.ko for kernel 5.10 or 5.15 exists in any
-   public repo. This is the fundamental blocker for a native BCM4389 approach.
-   The standalone `wonder_mosey_wild.ko` is the only viable workaround.
+```bash
+# Module loaded
+adb shell su -c 'ksud module list | grep mosey'
 
-5. **Play Integrity**: Do not spoof `Build.DEVICE` or `Build.MODEL` to `blazer`
-   (Pixel 10). TrickyStore + PlayIntegrityFork must remain intact.
+# Binaries in place
+adb shell ls -la /odm/bin/mosey_server /odm/bin/mosey_bridge
 
-6. **Non-Pixel devices**: Theoretically applicable to any Android phone with
-   KSU/Magisk. The mosey_server binary and SELinux policy are Pixel-native;
-   behavior on other OEM devices is untested and may require additional
-   vendor policy adaptation.
+# mosey_server running
+adb shell ps -ef | grep mosey
+
+# Binder service registered
+adb shell service check com.google.android.moseyservice.IMoseyService
+
+# Bridge listening
+adb shell su -c 'ss -tlnp | grep 19539'
+```
+
+### Quick status check
+
+```bash
+adb shell su -c '/data/adb/modules/mosey-enabler/mosey-control.sh webui status'
+```
+
+---
+
+## Bridge Protocol API
+
+The bridge listens on **TCP 127.0.0.1:19539** and uses a binary frame protocol.
+
+### Frame format
+
+```
+Offset  Size  Field
+────────────────────────────────
+  0      1    type        (0x01=Request, 0x02=Reply, 0x03=Event)
+  1      4    payload_len (unsigned 32-bit LE)
+  5      N    payload     (type-specific bytes)
+```
+
+All multi-byte integers are **little-endian**.
+
+### Commands (type=0x01 Request → type=0x02 Reply)
+
+| Cmd | Name | Request payload | Reply payload | Description |
+|-----|------|----------------|---------------|-------------|
+| 0 | `getVersion` | `[0x00]` | `[status:i32][version:i32]` | Returns bridge protocol version |
+| 1 | `start` | `[0x01][filters_len:i32][filters:i32[]]` | `[status:i32]` | Start AWDL discovery with channel filters |
+| 2 | `stop` | `[0x02]` | `[status:i32]` | Stop AWDL discovery |
+| 3 | `update` | `[0x03][cc_len:i32][cc:utf8]` | `[status:i32]` | Update country code (e.g. "CN", "US") |
+| 4 | `subscribe` | `[0x04]` | `[status:i32]` | Subscribe to bridge events (only 1 subscriber at a time) |
+| 5 | `wakeBada` | `[0x05]` | `[status:i32]` | Send broadcast to Bada's AirDropWakeReceiver |
+| 6 | `enable` | `[0x06]` | `[status:i32]` | Enable mosey via mosey-control.sh (runs `webui enable`) |
+| 7 | `disable` | `[0x07]` | `[status:i32]` | Disable mosey via mosey-control.sh (runs `webui disable`) |
+| 8 | `status` | `[0x08]` | `[status:i32][json_len:i32][json:utf8]` | Query full status as JSON |
+
+### Events (type=0x03 Event)
+
+Sent by the bridge to the subscribed client. Format:
+
+```
+[tx_code:u32][event_data...]
+```
+
+| tx_code | Name | Payload | Description |
+|---------|------|---------|-------------|
+| 1 | Event | JSON string | Forwarded Binder callback from mosey_server |
+| 3 | Apple BLE seen | JSON `{"deviceName":"...","mac":"..."}` | BLE beacon from Apple device detected |
+
+### Reply status codes
+
+| Status | Meaning |
+|--------|---------|
+| 0 | Success |
+| -1 | General failure |
+| -2 | Command not recognized |
+| -3 | Bridge not connected to mosey_server |
+
+### Wire examples (hex)
+
+```
+→ getVersion:     01 00 00 00 01 00
+← reply:         02 08 00 00 00 00 00 00 00 01 00 00 00
+                              └─status=0 └─version=1
+
+→ start [149,44]: 01 0D 00 00 00 01 02 00 00 00 95 00 00 00 2C 00 00 00
+                              └─cmd └─len=2 └─149    └─44
+← reply:         02 04 00 00 00 00 00 00 00
+                              └─status=0
+
+→ status:         01 01 00 00 00 08
+← reply:         02 XX XX XX 00 ...json...
+```
+
+### Protocol notes
+
+- **Connection model**: Simple request-response. The client sends one request and reads one reply. No pipelining.
+- **Subscription**: Sending `subscribe` (cmd 4) registers this connection as the event subscriber. Only one subscriber is allowed. If a new connection subscribes, the old one is silently replaced.
+- **Timeout**: The bridge sets `SO_RCVTIMEO` and `SO_SNDTIMEO` to 2 seconds on its UNIX control socket. TCP clients should also set read timeouts.
+- **Status JSON format** (returned by cmd 8):
+
+```json
+{
+  "enabled": true,
+  "nativeRunning": true,
+  "bridgeRunning": true,
+  "shimRunning": true,
+  "wifiConnected": false,
+  "mosey0Exists": true,
+  "wonderLoaded": true,
+  "countryCode": "CN",
+  "countryMode": "fixed"
+}
+```
+
+---
+
+## Control Interface API
+
+The shell-based control interface is at `/data/adb/modules/mosey-enabler/mosey-control.sh` on the device.
+
+### Commands
+
+```bash
+# Enable mosey (starts server + bridge + shim)
+mosey-control.sh webui enable
+
+# Disable mosey (stops all components)
+mosey-control.sh webui disable
+
+# Query status (returns JSON)
+mosey-control.sh webui status
+
+# Show status in human-readable format
+mosey-control.sh webui show
+```
+
+### Status JSON fields
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `enabled` | bool | Mosey is enabled (mosey-enable flag file exists) |
+| `nativeRunning` | bool | `mosey_server` process is running |
+| `bridgeRunning` | bool | `mosey_bridge` process is running |
+| `shimRunning` | bool | `MoseyBridgeShim` foreground service is running |
+| `wifiConnected` | bool | Device has an active WiFi connection (STA mode) |
+| `mosey0Exists` | bool | `mosey0` network interface exists |
+| `wonderLoaded` | bool | `wonder.ko` kernel module is loaded |
+| `countryCode` | string | Current country code (e.g. "CN") |
+| `countryMode` | string | How country code is set: "fixed" or "dynamic" |
+
+### Watchdog
+
+The control script runs a built-in watchdog loop that:
+- Checks every 30 seconds that all components are healthy
+- Recovers failed components (restarts server/bridge/shim)
+- Uses a non-blocking operation lock to avoid races with manual enable/disable
+- Gracefully handles SHIM failures (up to 5 consecutive failures before giving up)
+
+### WebUI
+
+The module includes a KernelSU WebUI at `webroot/index.html` that provides:
+- On/off toggle for mosey
+- Real-time status grid
+- Log viewer
+
+---
+
+## Boot Sequence
+
+```
+Power on
+  │
+  ├─ init scans /odm/etc/init/*.rc
+  │   └─ mosey.rc NOT YET visible (KSU overlay not mounted)
+  │
+  ├─ KernelSU post-fs-data
+  │   ├─ KSU magic mount activates (odm/ → /odm/, system_ext/ → /system_ext/)
+  │   └─ post-fs-data.sh:
+  │       ├─ chmod 755 mosey_server, mosey_bridge
+  │       └─ Append /odm/${LIB} to linker namespace → mosey_server can dlopen
+  │
+  ├─ KernelSU late_start (service.sh)
+  │   ├─ Start mosey_server (Rust, AWDL radio daemon)
+  │   │   └─ Registers Binder service on default binder
+  │   ├─ Wait for mosey_server ready (socket check + Binder probe)
+  │   └─ Start mosey_bridge (TCP listener on :19539)
+  │
+  ├─ Boot completed (boot-completed.sh)
+  │   └─ Start MoseyBridgeShim foreground service (BLE scan + HTTPS)
+  │
+  └─ User unlocks device
+      └─ External apps (Bada) connect to bridge via TCP :19539
+```
+
+---
+
+## Source Code Reference
+
+### `src/bridge/mosey_bridge.c`
+
+The core TCP↔Binder bridge. Key implementation details:
+
+- **Thread model**: Accept thread accepts new TCP connections. Each client gets a dedicated handler thread (`client_thread`).
+- **Binder connection**: Connects to `mosey_server` via `AServiceManager_checkService` (non-blocking, unlike `getService`).
+- **Command dispatching**: Incoming commands are dispatched by `handle_cmd()`:
+  - CMD 0-3: Forwarded to mosey_server via Binder transact
+  - CMD 5: `am broadcast` to `AirDropWakeReceiver`
+  - CMD 6-8: `popen`/`system` to `mosey-control.sh`
+- **Event forwarding**: A single `g_subscriber` TCP client receives forwarded Binder callbacks as type-0x03 frames.
+- **Backend selection**: Supports `--backend-probe unix|binder|auto` and `MOSEY_BACKEND` env var. Default is `auto` (Binder, fallback to UNIX socket).
+- **Async disable**: CMD_DISABLE forks, calls `setsid()`, then `execl()` to avoid killing the bridge process itself.
+
+### `src/bridge/mosey_preload.c`
+
+LD_PRELOAD library that intercepts `AServiceManager_addService` and returns `STATUS_OK` without actually registering. Used when `mosey_launcher` has already pre-registered the service.
+
+### `src/shim/java/MoseyShim.java`
+
+Java shim that is loaded as `mosey-shim.jar` from `/odm/framework/`. Provides:
+- `MoseyNative` — JNI bridge to native methods
+- Service initialization callbacks for `mosey_server`
+
+### `src/shim/app/` — MoseyBridgeShim APK
+
+An Android priv-app that provides:
+- `MoseyShimService` — Foreground service with BLE scanning and AWDL HTTPS listener
+- `RawMdnsEngine` — Direct mDNS parsing on `mosey0` interface for Apple device discovery
+- TLS listener on TCP :19541 for AirDrop `/Discover`, `/Ask`, `/Upload`
+
+### `module_mosey/mosey-control.sh`
+
+Shell-based control (701 lines). Key functions:
+
+| Function | Purpose |
+|----------|---------|
+| `mosey_enable()` | Start mosey_server, bridge, shim; create mosey0; configure WiFi |
+| `mosey_disable()` | Stop mosey_server, bridge, shim; restore WiFi; clean up |
+| `check_backend_fast()` | Quick `ss`-based check if bridge is listening |
+| `check_backend_probe()` | Connect to bridge and probe via Binder or UNIX socket |
+| `wait_for_backend()` | Two-phase wait: 20s socket poll + 3 probe attempts |
+| `with_operation_lock()` | Acquire lock file, run a command, release (blocking) |
+| `try_with_operation_lock()` | Non-blocking lock attempt (returns 75 if busy) |
+| `run_watchdog()` | Background health check loop (30s interval) |
+
+---
+
+## Known Limitations
+
+1. **Requires mosey_server binary**: The Rust `mosey_server` and `libmosey_daemon_ffi.so` are not bundled — they must be extracted from a OnePlus GLO or Pixel vendor image.
+2. **Qualcomm wonder.ko required**: This project targets devices with Qualcomm WiFi chipsets that have `wonder.ko` with `wondertap` support. Other chipsets (MediaTek, BCM without wondertap) are not supported.
+3. **WiFi disconnection during mosey use**: Qualcomm's concurrency policy prevents STA + wondertap simultaneously. The shim disconnects WiFi before starting mosey and reconnects on stop.
+4. **SELinux**: The KSU module's `sepolicy.rule` provides rules for the `ksu` domain. If `mosey_server` runs under a different SELinux context, additional rules may be needed.
+5. **ColorOS/OPlus freezer**: Devices with OPlus freezer may trap Bada processes in `do_freezer_trap`. The module configures `RUN_IN_BACKGROUND` whitelist as a workaround.
+6. **One subscriber limit**: The bridge supports only one event subscriber at a time. Use `MoseyControlClient` (short-lived, no subscription) for operational commands.
+
+---
+
+*For research and debugging purposes only. Not for commercial use.*

@@ -55,9 +55,9 @@ if [ ! -x "$CLANG" ]; then
   exit 1
 fi
 "$CLANG" -O2 -Wall -Wextra -o "$MODULE_DIR/odm/bin/mosey_bridge" \
-  "$SCRIPT_DIR/mosey_bridge.c" -lbinder_ndk -ldl -llog -pthread
+  "$SCRIPT_DIR/src/bridge/mosey_bridge.c" -lbinder_ndk -ldl -llog -pthread
 "$CLANG" -O2 -Wall -Wextra -shared -fPIC -o "$MODULE_DIR/odm/lib64/libmosey_preload.so" \
-  "$SCRIPT_DIR/mosey_preload.c" -ldl -llog -pthread
+  "$SCRIPT_DIR/src/bridge/mosey_preload.c" -ldl -llog -pthread
 
 echo "[*] Building Java shim..."
 if [ ! -f "$ANDROID_JAR" ]; then
@@ -72,7 +72,7 @@ SHIM_BUILD="$SCRIPT_DIR/.build/mosey-shim"
 rm -rf "$SHIM_BUILD"
 mkdir -p "$SHIM_BUILD/classes" "$MODULE_DIR/odm/framework" "$MODULE_DIR/odm/etc/mosey-shim"
 javac -source 8 -target 8 -bootclasspath "$ANDROID_JAR" \
-  -d "$SHIM_BUILD/classes" "$SCRIPT_DIR/shim_src/MoseyShim.java"
+  -d "$SHIM_BUILD/classes" "$SCRIPT_DIR/src/shim/java/MoseyShim.java"
 jar cf "$SHIM_BUILD/mosey-shim-classes.jar" -C "$SHIM_BUILD/classes" .
 "$D8" --min-api 31 --output "$MODULE_DIR/odm/framework/mosey-shim.jar" \
   "$SHIM_BUILD/mosey-shim-classes.jar"
@@ -91,15 +91,15 @@ mkdir -p "$APK_BUILD/classes" "$APK_BUILD/stub-classes" "$APK_BUILD/dex" "$APK_B
          "$MODULE_DIR/payload"
 javac -source 8 -target 8 -bootclasspath "$ANDROID_JAR" \
   -d "$APK_BUILD/stub-classes" \
-  "$SCRIPT_DIR"/shim_app/stubs/android/net/*.java
+  "$SCRIPT_DIR"/src/shim/app/stubs/android/net/*.java
 jar cf "$APK_BUILD/mosey-hidden-api-stubs.jar" -C "$APK_BUILD/stub-classes" .
 javac -source 8 -target 8 -bootclasspath "$ANDROID_JAR" \
   -classpath "$APK_BUILD/mosey-hidden-api-stubs.jar" \
   -d "$APK_BUILD/classes" \
-  "$SCRIPT_DIR"/shim_app/src/dev/bluehouse/moseyshim/*.java
+  "$SCRIPT_DIR"/src/shim/app/src/dev/bluehouse/moseyshim/*.java
 jar cf "$APK_BUILD/mosey-shim-apk-classes.jar" -C "$APK_BUILD/classes" .
 "$D8" --min-api 31 --output "$APK_BUILD/dex" "$APK_BUILD/mosey-shim-apk-classes.jar"
-"$AAPT2" compile --dir "$SCRIPT_DIR/shim_app/res" -o "$APK_BUILD/compiled"
+"$AAPT2" compile --dir "$SCRIPT_DIR/src/shim/app/res" -o "$APK_BUILD/compiled"
 build_shim_apk() {
   local VERSION_CODE="$1"
   local VERSION_NAME="$2"
@@ -107,7 +107,7 @@ build_shim_apk() {
   local STEM="$4"
 
   "$AAPT2" link -I "$ANDROID_JAR" \
-    --manifest "$SCRIPT_DIR/shim_app/AndroidManifest.xml" \
+    --manifest "$SCRIPT_DIR/src/shim/app/AndroidManifest.xml" \
     --min-sdk-version 31 --target-sdk-version 36 \
     --version-code "$VERSION_CODE" --version-name "$VERSION_NAME" --replace-version \
     -o "$APK_BUILD/$STEM.unsigned.apk" "$APK_BUILD/compiled"/*.flat
