@@ -1,4 +1,4 @@
-# Mosey Extended
+# Mosey Implementation via KernelSU
 
 > **Experimental & In Active Development. For research purposes only.**
 
@@ -456,3 +456,7 @@ Shell-based control (701 lines). Key functions:
 ---
 
 *For research and debugging purposes only. Not for commercial use.*
+
+# Reference
+
+- [mosey-extended](https://github.com/thelok1s/mosey-extended)
