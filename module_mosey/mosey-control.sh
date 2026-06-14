@@ -91,15 +91,42 @@ check_backend_fast() {
 }
 
 # ── 有超时的后端探测（用于初始启动） ──
+# 优先使用 toybox timeout（支持 -k SIGKILL 防残留）
+# 强制 UNIX 后端绕过 AServiceManager_getService 的 ~5 秒轮询
 check_backend_probe() {
-    /odm/bin/mosey_bridge --backend-probe >/dev/null 2>&1 &
-    local BPID=$!
-    (sleep 5; kill "$BPID" 2>/dev/null) &
-    local KILLER=$!
-    wait "$BPID" 2>/dev/null
-    local RC=$?
+    local RC
+    MOSEY_BACKEND=unix \
+        /system/bin/toybox timeout -k 1 3 \
+        /odm/bin/mosey_bridge --backend-probe \
+        >/dev/null 2>&1
+    RC=$?
+    case "$RC" in
+        0) return 0 ;;
+        124|137) log_msg "[w] UNIX backend probe timed out rc=$RC" ;;
+        *) log_msg "[w] UNIX backend probe failed rc=$RC" ;;
+    esac
+    return 1
+}
+
+# ── 没有 toybox 时的安全 fallback（两阶段 SIGTERM + SIGKILL） ──
+check_backend_probe_fallback() {
+    local PID KILLER RC
+    MOSEY_BACKEND=unix \
+        /odm/bin/mosey_bridge --backend-probe \
+        >/dev/null 2>&1 &
+    PID=$!
+    (
+        sleep 3
+        kill -0 "$PID" 2>/dev/null && kill -TERM "$PID" 2>/dev/null
+        sleep 1
+        kill -0 "$PID" 2>/dev/null && kill -KILL "$PID" 2>/dev/null
+    ) &
+    KILLER=$!
+    wait "$PID" 2>/dev/null
+    RC=$?
     kill "$KILLER" 2>/dev/null
-    return $RC
+    wait "$KILLER" 2>/dev/null
+    return "$RC"
 }
 
 check_bridge() {
@@ -344,7 +371,27 @@ start_mosey_server() {
 
 wait_for_backend() {
     local TRY
-    for TRY in $(seq 1 30); do
+
+    # ── 第一阶段：等待 UNIX socket 就绪（最多 20 秒） ──
+    for TRY in $(seq 1 20); do
+        if ! server_pid >/dev/null 2>&1; then
+            log_msg "[x] mosey_server exited while waiting for backend"
+            return 1
+        fi
+        if check_backend_fast; then
+            log_msg "[+] Mosey UNIX socket is listening"
+            break
+        fi
+        sleep 1
+    done
+
+    if ! check_backend_fast; then
+        log_msg "[x] Timed out waiting for Mosey UNIX socket"
+        return 1
+    fi
+
+    # ── 第二阶段：最多 3 次真实事务探测 ──
+    for TRY in 1 2 3; do
         if check_backend_probe; then
             if check_unix_backend; then
                 log_msg "[+] Mosey backend transaction probe passed; UNIX fallback available"
@@ -355,9 +402,11 @@ wait_for_backend() {
             fi
             return 0
         fi
+        log_msg "[w] Backend transaction probe failed attempt=$TRY/3"
         sleep 1
     done
-    log_msg "[x] Timed out waiting for Binder or preload UNIX backend"
+
+    log_msg "[x] Mosey UNIX backend socket exists but transaction probe failed"
     return 1
 }
 

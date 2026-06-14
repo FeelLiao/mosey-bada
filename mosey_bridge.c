@@ -17,6 +17,7 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <sys/un.h>
 #include <time.h>
 #include <unistd.h>
@@ -157,6 +158,12 @@ static bool send_raw_frame(int fd, uint8_t type, const uint8_t* payload, size_t 
            (!len || write_exact(fd, payload, len));
 }
 
+static void configure_socket_timeout(int fd) {
+    struct timeval tv = { .tv_sec = 2, .tv_usec = 0 };
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+}
+
 static int connect_unix(void) {
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) return -1;
@@ -168,6 +175,7 @@ static int connect_unix(void) {
         close(fd);
         return -1;
     }
+    configure_socket_timeout(fd);
     return fd;
 }
 
@@ -380,13 +388,21 @@ static bool init_backend(void) {
     start_binder_thread_pool();
     const char* forced_backend = getenv("MOSEY_BACKEND");
     bool force_unix = forced_backend && strcmp(forced_backend, "unix") == 0;
+    bool force_binder = forced_backend && strcmp(forced_backend, "binder") == 0;
     void* lib = dlopen("libbinder_ndk.so", RTLD_NOW | RTLD_LOCAL);
-    AIBinder* (*get_service)(const char*) = lib
-        ? (AIBinder* (*)(const char*))dlsym(lib, "AServiceManager_getService") : NULL;
-    if (get_service && !force_unix) {
-        g_service = get_service(SERVICE_NAME);
-        if (g_service) {
-            if (associate_service_class(g_service)) {
+    /* 使用 checkService 而非 getService：后者在服务不存在时轮询 ~5 秒 */
+    AIBinder* (*check_service)(const char*) = lib
+        ? (AIBinder* (*)(const char*))dlsym(lib, "AServiceManager_checkService") : NULL;
+    if (check_service && !force_unix) {
+        g_service = check_service(SERVICE_NAME);
+        if (g_service || force_binder) {
+            /* checkService 返回 NULL 时仍可能重试；force_binder 模式强制等待 */
+            if (!g_service && force_binder) {
+                AIBinder* (*get_service)(const char*) = lib
+                    ? (AIBinder* (*)(const char*))dlsym(lib, "AServiceManager_getService") : NULL;
+                if (get_service) g_service = get_service(SERVICE_NAME);
+            }
+            if (g_service && associate_service_class(g_service)) {
                 g_backend = BACKEND_BINDER;
                 int32_t version = backend_call(CMD_GET_VERSION, NULL, 0);
                 if (version >= 0) {
@@ -394,8 +410,7 @@ static bool init_backend(void) {
                     return true;
                 }
             }
-            AIBinder_decStrong(g_service);
-            g_service = NULL;
+            if (g_service) { AIBinder_decStrong(g_service); g_service = NULL; }
         }
     }
     g_unix_fd = connect_unix();
@@ -614,7 +629,11 @@ static void handle_signal(int sig) { (void)sig; g_running = 0; }
 int main(int argc, char** argv) {
     signal(SIGPIPE, SIG_IGN);
     if (argc == 2 && strcmp(argv[1], "--probe") == 0) return probe();
-    if (argc == 2 && strcmp(argv[1], "--backend-probe") == 0) {
+    if ((argc == 2 || argc == 3) && strcmp(argv[1], "--backend-probe") == 0) {
+        /* 支持 --backend-probe unix|binder|auto */
+        if (argc == 3) {
+            setenv("MOSEY_BACKEND", argv[2], 1);
+        }
         return init_backend() ? 0 : 1;
     }
     signal(SIGTERM, handle_signal);
