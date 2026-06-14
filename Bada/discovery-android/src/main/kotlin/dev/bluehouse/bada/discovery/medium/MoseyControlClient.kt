@@ -32,7 +32,6 @@ public class MoseyControlClient(
     private val host: String = "127.0.0.1",
     private val port: Int = 19539,
     private val connectTimeoutMs: Int = 3000,
-    private val readTimeoutMs: Int = 15000,
 ) {
     private data class BridgeReply(val status: Int, val data: ByteArray)
 
@@ -43,6 +42,11 @@ public class MoseyControlClient(
         private const val FRAME_REQUEST: Byte = 0x01
         private const val FRAME_REPLY: Byte = 0x02
         private const val MAX_FRAME_SIZE = 64 * 1024
+
+        // 命令级超时
+        private const val STATUS_TIMEOUT_MS = 5_000
+        private const val DISABLE_TIMEOUT_MS = 15_000
+        private const val ENABLE_TIMEOUT_MS = 60_000
     }
 
     /**
@@ -50,7 +54,7 @@ public class MoseyControlClient(
      * mosey_bridge, and shim foreground service.
      */
     public fun enable(): Boolean {
-        val reply = execCmd(MoseySocketClient.CMD_ENABLE)
+        val reply = execCmd(MoseySocketClient.CMD_ENABLE, readTimeoutMs = ENABLE_TIMEOUT_MS)
         return reply != null && reply.status == 0
     }
 
@@ -59,7 +63,7 @@ public class MoseyControlClient(
      * re-enable Wi-Fi.
      */
     public fun disable(): Boolean {
-        val reply = execCmd(MoseySocketClient.CMD_DISABLE)
+        val reply = execCmd(MoseySocketClient.CMD_DISABLE, readTimeoutMs = DISABLE_TIMEOUT_MS)
         return reply != null && reply.status == 0
     }
 
@@ -69,7 +73,7 @@ public class MoseyControlClient(
      * is unreachable or returns an error.
      */
     public fun status(): MoseyStatus? {
-        val reply = execCmd(MoseySocketClient.CMD_STATUS) ?: return null
+        val reply = execCmd(MoseySocketClient.CMD_STATUS, readTimeoutMs = STATUS_TIMEOUT_MS) ?: return null
         if (reply.status != 0 || reply.data.size < 4) return null
         val jsonLen = readInt32(reply.data, 0)
         if (jsonLen !in 1..4096) return null
@@ -93,7 +97,7 @@ public class MoseyControlClient(
 
     // ── low-level command execution ──
 
-    private fun execCmd(cmd: Byte, params: ByteArray = ByteArray(0)): BridgeReply? {
+    private fun execCmd(cmd: Byte, params: ByteArray = ByteArray(0), readTimeoutMs: Int = 15000): BridgeReply? {
         var socket: Socket? = null
         return try {
             socket = Socket()

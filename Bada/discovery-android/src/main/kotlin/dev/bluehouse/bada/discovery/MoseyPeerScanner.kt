@@ -69,6 +69,10 @@ public class MoseyPeerScanner(
                         Log.w(TAG, "Mosey event connection closed: $reason")
                         close()
                     }
+
+                    override fun onAppleBleSeen(deviceName: String, mac: String?) {
+                        Log.d(TAG, "Apple BLE seen during peer scan: $deviceName")
+                    }
                 },
             )
             if (!client.connect()) {

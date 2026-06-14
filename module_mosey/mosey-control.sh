@@ -670,11 +670,15 @@ start_shim() {
 
 with_operation_lock() {
     local COMMAND="$1"
-    local TRY
+    shift
+    local TRY RC
     for TRY in $(seq 1 60); do
         if mkdir "$OPERATION_LOCK" 2>/dev/null; then
-            "$COMMAND"
-            local RC=$?
+            (
+                trap 'rmdir "$OPERATION_LOCK" 2>/dev/null' EXIT HUP INT TERM
+                "$COMMAND" "$@"
+            )
+            RC=$?
             rmdir "$OPERATION_LOCK" 2>/dev/null
             return "$RC"
         fi
@@ -682,6 +686,23 @@ with_operation_lock() {
     done
     log_msg "[x] Timed out waiting for operation lock"
     return 1
+}
+
+# ── 非阻塞操作锁（用于 watchdog，获取不到返回 75）──
+try_with_operation_lock() {
+    local COMMAND="$1"
+    shift
+    local RC
+    if ! mkdir "$OPERATION_LOCK" 2>/dev/null; then
+        return 75
+    fi
+    (
+        trap 'rmdir "$OPERATION_LOCK" 2>/dev/null' EXIT HUP INT TERM
+        "$COMMAND" "$@"
+    )
+    RC=$?
+    rmdir "$OPERATION_LOCK" 2>/dev/null
+    return "$RC"
 }
 
 run_watchdog() {
@@ -693,19 +714,18 @@ run_watchdog() {
     trap 'rm -f "$WATCHDOG_PID_FILE"; rmdir "$WATCHDOG_LOCK" 2>/dev/null' EXIT INT TERM
     log_msg "[+] Unified watchdog started pid=$$"
 
-    local BRIDGE_FAILURES=0 SHIM_FAILURES=0 DELAY PID
+    local BRIDGE_FAILURES=0 SHIM_FAILURES=0 DELAY PID RC
     while true; do
-        sleep 30
-
-        # ── 未启用时清理残留进程并恢复 Wi-Fi ──
+        # ── 未启用时，通过操作锁安全清理 ──
         if [ ! -f "$STATE_DIR/enabled" ]; then
-            if server_pid >/dev/null 2>&1 || check_shim; then
-                log_msg "[!] Mosey not enabled but processes persist; cleaning up"
-                stop_native_stack
-                am force-stop "$SHIM_PKG" >/dev/null 2>&1 || true
-                svc wifi enable 2>/dev/null || true
-                clear_mosey_ipv6_rules
-            fi
+            try_with_operation_lock watchdog_cleanup_disabled
+            RC=$?
+            case "$RC" in
+                0) ;;
+                75) log_msg "[*] Watchdog cleanup skipped: operation in progress" ;;
+                *) log_msg "[w] Watchdog disabled-state cleanup failed rc=$RC" ;;
+            esac
+            sleep 30
             continue
         fi
 
@@ -723,7 +743,7 @@ run_watchdog() {
                 if check_shim; then
                     log_msg "[*] Restarting shim after native control recovery"
                     am force-stop "$SHIM_PKG" >/dev/null 2>&1
-                    with_operation_lock start_shim || true
+                    try_with_operation_lock start_shim || true
                 fi
             fi
         elif ! check_bridge; then
@@ -738,12 +758,11 @@ run_watchdog() {
                 if check_shim; then
                     log_msg "[*] Restarting shim after native control recovery"
                     am force-stop "$SHIM_PKG" >/dev/null 2>&1
-                    with_operation_lock start_shim || true
+                    try_with_operation_lock start_shim || true
                 fi
             fi
         else
             BRIDGE_FAILURES=0
-            SHIM_FAILURES=0
             ensure_mosey_ipv6_rules || true
             if ! persist_mosey_country_code; then
                 log_msg "[w] Watchdog failed to maintain fixed country=$MOSEY_COUNTRY_CODE"
@@ -751,16 +770,22 @@ run_watchdog() {
         fi
 
         if [ "$(getprop sys.boot_completed)" = "1" ] && [ -f "$STATE_DIR/enabled" ]; then
-            if ! check_shim; then
+            if check_shim; then
+                SHIM_FAILURES=0
+            else
                 SHIM_FAILURES=$((SHIM_FAILURES + 1))
-                DELAY=$(backoff_for "$SHIM_FAILURES")
-                log_msg "[!] Watchdog shim recovery $SHIM_FAILURES after ${DELAY}s"
-                sleep "$DELAY"
-                if with_operation_lock start_shim; then
-                    SHIM_FAILURES=0
-                fi
+                log_msg "[!] Watchdog shim recovery attempt=$SHIM_FAILURES"
+                try_with_operation_lock start_shim
+                RC=$?
+                case "$RC" in
+                    0) SHIM_FAILURES=0 ;;
+                    75) log_msg "[*] Shim recovery skipped: operation in progress" ;;
+                    *) log_msg "[w] Shim recovery failed attempt=$SHIM_FAILURES rc=$RC" ;;
+                esac
             fi
         fi
+
+        sleep 30
     done
 }
 
@@ -822,67 +847,125 @@ webui_status() {
         "$MOSEY_COUNTRY_CODE" "$MOSEY_COUNTRY_MODE"
 }
 
-webui_enable() {
-    [ -f "$STATE_DIR/enabled" ] && { log_msg "[*] Mosey already enabled"; return 0; }
-
-    # 记录当前 Wi-Fi 状态
+webui_enable_locked() {
     local WIFI_WAS_ON=false
-    if dumpsys wifi 2>/dev/null | grep -q 'Wi-Fi is enabled'; then
-        WIFI_WAS_ON=true
-        echo "true" > "$STATE_DIR/wifi_was_on"
-        chmod 600 "$STATE_DIR/wifi_was_on" 2>/dev/null
+
+    # enabled 已存在时检查健康状态，非健康则修复。
+    if [ -f "$STATE_DIR/enabled" ]; then
+        if check_bridge && check_shim && [ -d /sys/class/net/mosey0 ]; then
+            log_msg "[*] Mosey already enabled and healthy"
+            echo "Mosey already enabled"
+            return 0
+        fi
+        log_msg "[!] Mosey enabled state is degraded; repairing stack"
     fi
 
-    # 断开 Wi-Fi（让出射频给 wondertap）
+    # 仅在 Wi-Fi 当前开启时记录恢复状态。
+    if dumpsys wifi 2>/dev/null | grep -q 'Wi-Fi is enabled'; then
+        WIFI_WAS_ON=true
+        if [ ! -f "$STATE_DIR/wifi_was_on" ]; then
+            printf '%s\n' "true" > "$STATE_DIR/wifi_was_on"
+            chmod 600 "$STATE_DIR/wifi_was_on" 2>/dev/null
+        fi
+    fi
+
     if [ "$WIFI_WAS_ON" = true ]; then
         log_msg "[*] Disabling Wi-Fi to free radio for mosey wondertap"
-        svc wifi disable 2>/dev/null || cmd wifi set-wifi-enabled disabled 2>/dev/null || true
+        svc wifi disable 2>/dev/null \
+            || cmd wifi set-wifi-enabled disabled 2>/dev/null \
+            || true
         sleep 3
     fi
 
-    # 启动 mosey 栈
-    start_native_stack || {
+    if ! start_native_stack; then
         log_msg "[x] Native stack failed to start"
-        [ "$WIFI_WAS_ON" = true ] && svc wifi enable 2>/dev/null || true
-        rm -f "$STATE_DIR/wifi_was_on"
+        if [ ! -f "$STATE_DIR/enabled" ]; then
+            stop_native_stack
+            am force-stop "$SHIM_PKG" >/dev/null 2>&1 || true
+            [ "$WIFI_WAS_ON" = true ] && svc wifi enable 2>/dev/null || true
+            rm -f "$STATE_DIR/wifi_was_on"
+        fi
         return 1
-    }
-    with_operation_lock start_shim || {
-        log_msg "[x] Shim failed to start; rolling back"
-        stop_native_stack
-        [ "$WIFI_WAS_ON" = true ] && svc wifi enable 2>/dev/null || true
-        rm -f "$STATE_DIR/wifi_was_on"
-        return 1
-    }
+    fi
 
-    touch "$STATE_DIR/enabled"
+    # 直接调用 start_shim（已持有 operation.lock，不能再次 with_operation_lock）
+    if ! start_shim; then
+        log_msg "[x] Shim failed to start; rolling back"
+        if [ ! -f "$STATE_DIR/enabled" ]; then
+            am force-stop "$SHIM_PKG" >/dev/null 2>&1 || true
+            stop_native_stack
+            clear_mosey_ipv6_rules
+            [ "$WIFI_WAS_ON" = true ] && svc wifi enable 2>/dev/null || true
+            rm -f "$STATE_DIR/wifi_was_on"
+        fi
+        return 1
+    fi
+
+    # 最终健康检查通过后提交 enabled 状态。
+    if ! check_bridge || ! check_shim || [ ! -d /sys/class/net/mosey0 ]; then
+        log_msg "[x] Mosey startup completed but final health check failed"
+        return 1
+    fi
+
+    touch "$STATE_DIR/enabled" || {
+        log_msg "[x] Unable to commit enabled state"
+        return 1
+    }
     chmod 600 "$STATE_DIR/enabled" 2>/dev/null
-    log_msg "[+] Mosey enabled (WiFi: $([ "$WIFI_WAS_ON" = true ] && echo 'OFF' || echo 'unaffected'))"
+
+    log_msg "[+] Mosey enabled and healthy country=$MOSEY_COUNTRY_CODE"
     echo "Mosey enabled successfully"
     return 0
 }
 
-webui_disable() {
-    # 停止 shim
+webui_enable() {
+    with_operation_lock webui_enable_locked
+}
+
+webui_disable_locked() {
+    # 首先提交“期望关闭”状态。
+    rm -f "$STATE_DIR/enabled"
+
     am force-stop "$SHIM_PKG" >/dev/null 2>&1 || true
     sleep 1
 
-    # 停止 native 栈
     stop_native_stack
-
-    # 清理 IPv6 规则
     clear_mosey_ipv6_rules
 
-    # 恢复 Wi-Fi（始终尝试）
     log_msg "[*] Re-enabling Wi-Fi"
-    svc wifi enable 2>/dev/null || cmd wifi set-wifi-enabled enabled 2>/dev/null || true
+    svc wifi enable 2>/dev/null \
+        || cmd wifi set-wifi-enabled enabled 2>/dev/null \
+        || true
+
     cmd wifi force-country-code disabled >/dev/null 2>&1 || true
     sleep 2
 
-    # 清除状态
-    rm -f "$STATE_DIR/enabled" "$STATE_DIR/wifi_was_on" "$STATE_DIR/wifi_saved" 2>/dev/null
+    rm -f "$STATE_DIR/wifi_was_on" "$STATE_DIR/wifi_saved" 2>/dev/null
+
     log_msg "[-] Mosey disabled; Wi-Fi restored"
     echo "Mosey disabled, Wi-Fi restored"
+    return 0
+}
+
+webui_disable() {
+    with_operation_lock webui_disable_locked
+}
+
+# ── watchdog 锁内清理（仅在 enabled 不存在时执行）──
+watchdog_cleanup_disabled() {
+    # 获得锁后必须重新检查，避免状态在等待期间发生变化。
+    [ -f "$STATE_DIR/enabled" ] && return 0
+
+    if server_pid >/dev/null 2>&1 \
+            || bridge_pid >/dev/null 2>&1 \
+            || check_shim; then
+        log_msg "[!] Mosey disabled; cleaning residual processes"
+        am force-stop "$SHIM_PKG" >/dev/null 2>&1 || true
+        stop_native_stack
+        clear_mosey_ipv6_rules
+        svc wifi enable 2>/dev/null || true
+    fi
+
     return 0
 }
 

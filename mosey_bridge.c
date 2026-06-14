@@ -550,12 +550,25 @@ static void* client_thread(void* arg) {
             status = value;
             LOGI("command=enable result=%d", rc);
         } else if (cmd == CMD_DISABLE) {
-            int rc = system(
-                "/system/bin/sh /data/adb/modules/mosey-enabler/mosey-control.sh "
-                "webui disable >/dev/null 2>&1");
-            value = (rc == 0) ? 0 : -1;
-            status = value;
-            LOGI("command=disable result=%d", rc);
+            /* 先回复"命令已接受"，再异步执行 disable
+             * （避免同步 system() 杀死 bridge 自己导致无响应） */
+            uint8_t ok_reply[8];
+            write_i32(ok_reply, 0);
+            write_i32(ok_reply + 4, 0);
+            send_frame_locked(client, FRAME_REPLY, ok_reply, sizeof(ok_reply));
+            LOGI("command=disable accepted");
+            pid_t dpid = fork();
+            if (dpid == 0) {
+                setsid();
+                usleep(300 * 1000);
+                execl("/system/bin/sh", "sh",
+                    "/data/adb/modules/mosey-enabler/mosey-control.sh",
+                    "webui", "disable",
+                    (char*)NULL);
+                _exit(127);
+            }
+            free(payload);
+            continue;  /* 跳过默认 reply */
         } else if (cmd == CMD_STATUS) {
             FILE* fp = popen(
                 "/system/bin/sh /data/adb/modules/mosey-enabler/mosey-control.sh "
